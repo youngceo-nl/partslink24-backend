@@ -57,6 +57,21 @@ async function hasSessionFile() {
   }
 }
 
+// Circuit breaker: PartsLink24 locks the account after repeated failed
+// logins. If a login just failed with "credentials invalid" we cool off
+// before attempting another one — otherwise every incoming request would
+// trigger another login attempt and extend the lockout.
+const LOGIN_COOLDOWN_MS = 15 * 60 * 1000; // 15 minutes
+let lastLoginFailureAt = 0;
+let lastLoginFailureMessage = null;
+
+function loginOnCooldown() {
+  return Date.now() - lastLoginFailureAt < LOGIN_COOLDOWN_MS;
+}
+function loginCooldownRemainingMs() {
+  return Math.max(0, LOGIN_COOLDOWN_MS - (Date.now() - lastLoginFailureAt));
+}
+
 /**
  * Ensure the current context is authenticated. Returns whether a fresh login
  * happened (vs. the existing session being reused).
@@ -75,6 +90,17 @@ async function ensureLoggedIn({ force = false } = {}) {
     if (!force && sessionExists && (await isLoggedIn(page))) {
       log.info("partslink.login.reused", { url: page.url() });
       return { loggedIn: true, sessionReused: true };
+    }
+
+    // Circuit breaker — only check once we've confirmed the saved session
+    // isn't viable. Otherwise reuse would always work during cooldown.
+    if (loginOnCooldown()) {
+      const mins = Math.ceil(loginCooldownRemainingMs() / 60_000);
+      throw new UpstreamError(
+        `PartsLink24 login is on cooldown after a recent failure (${mins} min left). ` +
+        `Last error: ${lastLoginFailureMessage ?? "unknown"}`,
+        { code: "login_cooldown", minutesRemaining: mins },
+      );
     }
 
     // Root redirects unauth users to the login page; wait for the form to
@@ -162,13 +188,19 @@ async function ensureLoggedIn({ force = false } = {}) {
 
     if (!reallyLoggedIn) {
       const screenshot = await captureFailure(page, "login-failed");
-      log.error("partslink.login.failed", { errText, screenshot, url: page.url() });
+      lastLoginFailureAt = Date.now();
+      lastLoginFailureMessage = errText || "credentials may be incorrect or session was rejected";
+      log.error("partslink.login.failed", { errText, screenshot, url: page.url(), cooldownMin: LOGIN_COOLDOWN_MS / 60_000 });
       throw new UpstreamError("PartsLink24 login failed", {
         url: page.url(),
-        message: errText || "credentials may be incorrect or session was rejected",
+        message: lastLoginFailureMessage,
         screenshot,
       });
     }
+
+    // Fresh login succeeded — reset circuit breaker.
+    lastLoginFailureAt = 0;
+    lastLoginFailureMessage = null;
 
     await saveStorageState();
     log.info("partslink.login.success", { url: page.url() });
