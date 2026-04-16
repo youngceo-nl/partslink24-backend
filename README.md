@@ -133,41 +133,71 @@ Runs `decode-vin` then `lookup-part` and returns `{ vehicle, part }`.
 - **Headful in dev** — set `HEADLESS=false` in `.env` to watch the browser
   while debugging selectors.
 
+## Headless mode + anti-detection
+
+PartsLink24 fingerprints the browser and blocks vanilla headless Chrome
+(login reaches the form but "credentials incorrect"). `playwright-extra`
++ the stealth plugin masks the detection surface (`navigator.webdriver`,
+missing `chrome.runtime`, plugins array, permissions API, etc.) and
+headless runs work against production.
+
+Local dev with a visible window: set `HEADLESS=false` in `.env`.
+Production / server: leave `HEADLESS=true` (the default).
+
 ## Deploying to DigitalOcean
 
 ### App Platform (recommended)
 
-1. Create a new App → GitHub → pick this repo → branch `main`.
-2. Build command: `npm install` (the `postinstall` step runs `playwright
-   install chromium`).
-3. Run command: `npm start`.
-4. HTTP port: `3000`.
-5. Instance size: at least **Basic / 1GB RAM** — chromium needs ~800 MB.
-6. Add the three `PARTSLINK24_*` environment variables in the App spec, as
-   encrypted secrets.
+1. Push to GitHub (deploy-on-push is enabled in `.do/app.yaml`).
+2. Create the app once: `doctl apps create --spec .do/app.yaml` — or paste
+   the spec into the App Platform console.
+3. After first deploy, add the three `PARTSLINK24_*` env vars as **encrypted
+   secrets** in the console. They intentionally aren't in `app.yaml`.
+4. Health check is wired to `GET /health`.
 
-Chromium shared libraries (libnss, libatk, libcups …) are present in the
-App Platform Node.js buildpack image, so no custom Dockerfile is required
-for the default deploy path.
+The build uses the [Dockerfile](./Dockerfile), which is based on Microsoft's
+official Playwright image — chromium + all system libs are pre-installed,
+so the image size is larger but there are no missing-shared-library
+surprises at runtime.
+
+Instance size is set to `basic-s` (1 GB RAM). Anything smaller OOMs when
+Playwright launches chromium.
 
 ### Droplet (custom)
 
-If you need persistent session storage across deploys, use a Droplet:
+If you want persistent session storage across deploys (so the
+`sessions/partslink24.json` file survives container restarts):
 
 ```bash
 # Ubuntu 22.04
-apt install -y nodejs npm
-git clone https://github.com/essencesoftwaredevelopment/car-part-scraper.git
-cd car-part-scraper
-npm install
+curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+apt install -y nodejs git
+git clone https://github.com/youngceo-nl/partslink24-backend.git
+cd partslink24-backend
+npm install   # runs `playwright install chromium` via postinstall
+npx playwright install-deps chromium   # system libs
 cp .env.example .env && $EDITOR .env
-npx playwright install --with-deps chromium
+npm i -g pm2
 pm2 start src/server.js --name partslink24
-pm2 save
+pm2 save && pm2 startup
 ```
 
 The `sessions/` and `artifacts/` directories are persisted on the Droplet
-filesystem so the session survives restarts.
+filesystem, so the PartsLink24 session survives process restarts.
+
+### Caveats
+
+- **Datacenter IPs**: PartsLink24 may apply stricter bot-detection to
+  cloud IP ranges than to residential ones. If you see persistent
+  "credentials incorrect" after deploy despite correct creds, you may need
+  a residential proxy (Bright Data, Oxylabs, etc.).
+- **Session loss on App Platform**: App Platform containers are ephemeral.
+  A deploy or restart loses the cached `sessions/partslink24.json` and the
+  next request triggers a fresh login (~20s). Droplets avoid this.
+- **Concurrent sessions**: PartsLink24 shows a "session squeeze-out"
+  prompt if the same account is logged in from two places. The login
+  flow already auto-confirms to kill the old session — but means only one
+  replica of this service should run per account.
 
 ## Development scripts
 

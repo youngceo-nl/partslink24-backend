@@ -62,6 +62,46 @@ function brandForVin(vin) {
   return null;
 }
 
+// Extract structured fields from the catalog companion panel. The text is a
+// list of alternating label/value lines. Labels we know about get mapped
+// into camelCase fields; unknown labels are ignored. Anything we can't
+// confidently parse stays null so the caller can fall back on `companion`
+// (raw text).
+const COMPANION_LABELS = {
+  Model: "model",
+  "Date of production": "productionDate",
+  Year: "year",
+  "Sales type": "salesType",
+  "Engine Code": "engineCode",
+  "Transmission Code": "transmissionCode",
+  "Axle drive": "axleDrive",
+  Equipment: "equipment",
+  "Roof color": "roofColor",
+  "Carpet color code": "carpetColor",
+  "Exterior color / Paint Code": "paintCode",
+  "Seat combination no.": "seatCombination",
+  "Number of Z-Orders": "zOrderCount",
+  "PR no.": "prNumber",
+};
+
+function parseCompanion(text) {
+  if (!text || typeof text !== "string") return {};
+  const lines = text.split(/\n+/).map((s) => s.trim()).filter(Boolean);
+  const out = {};
+  for (let i = 0; i < lines.length - 1; i++) {
+    const field = COMPANION_LABELS[lines[i]];
+    if (!field) continue;
+    const raw = lines[i + 1];
+    out[field] = field === "year" ? parseYear(raw) : raw;
+  }
+  return out;
+}
+
+function parseYear(raw) {
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n >= 1900 && n <= 2100 ? n : null;
+}
+
 function validateVin(vin) {
   if (typeof vin !== "string" || !VIN_REGEX.test(vin.toUpperCase())) {
     throw new ValidationError("Invalid VIN — must be 17 chars (A-Z 0-9, no I/O/Q)");
@@ -106,18 +146,30 @@ async function decodeVin(rawVin, { brand: explicitBrand } = {}) {
         };
       }, CATALOG_SEL);
 
-      log.info("partslink.vin.decoded", { vin, brand: hintedBrand, meta });
+      const parsed = parseCompanion(meta.companion);
+      log.info("partslink.vin.decoded", { vin, brand: hintedBrand, parsed });
       return {
         vin,
         brand: hintedBrand,
-        // Per-brand structured parsers aren't wired yet — we surface the
-        // raw breadcrumb + companion text so callers can act on what the UI
-        // actually shows.
         make: meta.breadcrumb,
-        model: null,
-        year: null,
+        model: parsed.model ?? null,
+        year: parsed.year ?? null,
+        // PartsLink24 doesn't expose a separate "trim" label — the model
+        // string itself carries it (e.g. "GT3 RS GT3-3"). Leave null so the
+        // frontend can decide whether to derive it from `model`.
         trim: null,
-        engine: null,
+        engine: parsed.engineCode ?? null,
+        // Rich OEM-catalog fields only available from PartsLink24.
+        productionDate: parsed.productionDate ?? null,
+        salesType: parsed.salesType ?? null,
+        engineCode: parsed.engineCode ?? null,
+        transmissionCode: parsed.transmissionCode ?? null,
+        axleDrive: parsed.axleDrive ?? null,
+        equipment: parsed.equipment ?? null,
+        paintCode: parsed.paintCode ?? null,
+        roofColor: parsed.roofColor ?? null,
+        carpetColor: parsed.carpetColor ?? null,
+        seatCombination: parsed.seatCombination ?? null,
         meta: {
           resolved: !!meta.breadcrumb || !!meta.companion,
           url: meta.url,

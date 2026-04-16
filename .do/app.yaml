@@ -1,28 +1,40 @@
-# DigitalOcean App Platform spec. Create the app once with:
+# DigitalOcean App Platform spec. Create with:
 #   doctl apps create --spec .do/app.yaml
-# ...or paste this into the "App Spec" field in the DO web console.
 #
-# Secrets (PARTSLINK24_*) must be supplied separately as encrypted env vars
-# via the console or `doctl apps update` — they are NOT in this file.
+# Secrets (PARTSLINK24_*) are NOT in this file — add them as encrypted env
+# vars via the console or `doctl apps update` after the first deploy.
+#
+# Uses the Dockerfile at repo root, which is based on Microsoft's official
+# Playwright image and already has chromium + system libs installed.
 
-name: car-part-scraper
+name: partslink24-backend
 region: ams
 
 services:
   - name: api
     github:
-      repo: essencesoftwaredevelopment/car-part-scraper
+      repo: youngceo-nl/partslink24-backend
       branch: main
       deploy_on_push: true
-    build_command: npm install
-    run_command: npm start
+    dockerfile_path: Dockerfile
     http_port: 3000
-    instance_size_slug: basic-s  # 1 vCPU, 1 GB — chromium needs the headroom
+    # Playwright + chromium needs ~1 GB. Don't go smaller.
+    instance_size_slug: basic-s
     instance_count: 1
+    health_check:
+      http_path: /health
+      initial_delay_seconds: 10
+      period_seconds: 30
     envs:
+      - key: NODE_ENV
+        value: production
       - key: HEADLESS
         value: "true"
       - key: PORT
         value: "3000"
-      # The three PARTSLINK24_* vars must be added as SECRET-type env vars
-      # in the App Platform console after first deploy.
+      - key: PARTSLINK24_BASE_URL
+        value: https://www.partslink24.com
+      # Set these as SECRET in the App Platform console after first deploy:
+      # - PARTSLINK24_COMPANY_ID
+      # - PARTSLINK24_USERNAME
+      # - PARTSLINK24_ACCESS_CODE

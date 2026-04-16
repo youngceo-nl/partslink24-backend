@@ -1,0 +1,14 @@
+node_modules
+.git
+.env
+.env.local
+sessions/*
+!sessions/.gitkeep
+artifacts/*
+!artifacts/.gitkeep
+scraped-data
+*.log
+.DS_Store
+.idea
+.vscode
+npm-debug.log*

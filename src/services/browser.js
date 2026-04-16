@@ -9,7 +9,12 @@
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
-const { chromium } = require("playwright");
+// playwright-extra + stealth fixes the headless-chrome fingerprints
+// PartsLink24 detects (navigator.webdriver, chrome.runtime, missing
+// plugins array, etc.) so we can run on a server without a display.
+const { chromium } = require("playwright-extra");
+const stealth = require("puppeteer-extra-plugin-stealth")();
+chromium.use(stealth);
 const config = require("../config");
 const log = require("../utils/logger");
 
