@@ -45,8 +45,12 @@ async function captureVehicleImage(page, vin) {
       .isVisible({ timeout: 500 }).catch(() => false);
 
     if (!alreadyOpen) {
+      // Short timeout — when the trigger exists it's already in the DOM
+      // within ~1s of the catalog rendering. A long wait only slows down
+      // decodes for vehicles whose catalog has no graphical-nav (US VINs,
+      // demo-only brands) where we want to return quickly with a null.
       const trigger = page.locator('[aria-label="Graphical Navigation"]').first();
-      const hasTrigger = await trigger.isVisible({ timeout: 8000 }).catch(() => false);
+      const hasTrigger = await trigger.isVisible({ timeout: 2500 }).catch(() => false);
       if (!hasTrigger) {
         log.warn("partslink.vin.image_capture.no_trigger", { vin, url: page.url() });
         return null;
@@ -54,7 +58,7 @@ async function captureVehicleImage(page, vin) {
       await trigger.click();
     }
     // Give the Scope panel time to render its base64 image layers.
-    await page.waitForTimeout(2500);
+    await page.waitForTimeout(2000);
 
     // The catalog ships the exploded-view diagram as an inline base64 PNG
     // (1403×992 ish) inside the selected `_imageSelection_` item. Grab the
