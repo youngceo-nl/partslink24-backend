@@ -33,14 +33,21 @@ const SEL = {
 };
 
 async function dismissCookieBanner(page) {
-  // Fire-and-forget — the banner may not appear if cookies were already
-  // accepted in a previous session, and it sometimes takes a moment to
-  // render after the SPA mounts.
+  // Prefer Usercentrics' JS API — works even when the accept button
+  // renders outside the viewport, which happens on wider screens.
+  await page.evaluate(() => {
+    const ui = window.UC_UI;
+    if (ui?.acceptAllConsents) ui.acceptAllConsents().catch(() => {});
+    else if (ui?.closeCMP) ui.closeCMP();
+  }).catch(() => {});
+  await page.waitForTimeout(300);
+
+  // Fallback: force-click the accept button by its stable test-id.
   for (const sel of [SEL.cookieAcceptAll, SEL.cookieAcceptAllByText]) {
     const btn = page.locator(sel).first();
-    if (await btn.isVisible({ timeout: 1500 }).catch(() => false)) {
-      await btn.click().catch(() => {});
-      await page.waitForTimeout(500);
+    if ((await btn.count()) > 0) {
+      await btn.click({ force: true, timeout: 2000 }).catch(() => {});
+      await page.waitForTimeout(300);
       return true;
     }
   }

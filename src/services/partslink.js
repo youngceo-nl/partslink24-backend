@@ -108,11 +108,22 @@ async function ensureLoggedIn({ force = false } = {}) {
     await page.waitForSelector(SEL.companyId, { timeout: config.browser.actionTimeoutMs });
 
     // Usercentrics cookie overlay intercepts pointer events on the login
-    // inputs — dismiss it first.
-    const cookieBtn = page.locator('#usercentrics-root button[data-testid="uc-accept-all-button"]').first();
-    if (await cookieBtn.isVisible({ timeout: 1500 }).catch(() => false)) {
-      await cookieBtn.click().catch(() => {});
-      await page.waitForTimeout(400);
+    // inputs. The banner's accept button sometimes renders outside the
+    // viewport so isVisible/click fail silently — instead we call
+    // Usercentrics' globally-exposed JS API (`window.UC_UI`) which works
+    // regardless of DOM state. Falls back to a forced click on the
+    // button's stable data-testid.
+    await page.evaluate(() => {
+      const ui = window.UC_UI;
+      if (ui?.acceptAllConsents) ui.acceptAllConsents().catch(() => {});
+      else if (ui?.closeCMP) ui.closeCMP();
+    }).catch(() => {});
+    await page.waitForTimeout(300);
+    // Belt-and-braces: force-click the accept button if it's still in the DOM.
+    const cookieBtn = page.locator('button[data-testid="uc-accept-all-button"], [data-testid="uc-container"] button').first();
+    if (await cookieBtn.count() > 0) {
+      await cookieBtn.click({ force: true, timeout: 2000 }).catch(() => {});
+      await page.waitForTimeout(300);
     }
 
     log.info("partslink.login.submitting");
@@ -171,7 +182,12 @@ async function ensureLoggedIn({ force = false } = {}) {
     await page.waitForTimeout(1500);
 
     // Read any error message, then verify by navigating to root and
-    // checking the portal renders (has VIN search form).
+    // checking the portal renders (has VIN search form). Capture a
+    // screenshot BEFORE the verification nav so it shows the actual
+    // error state (red banner, account-locked message, whatever) rather
+    // than a clean logged-out landing page.
+    const preNavScreenshot = await captureFailure(page, "login-response")
+      .catch(() => null);
     const errText = await page
       .locator("#loginErrorDiv").first().innerText()
       .then((s) => s?.trim() || null)
