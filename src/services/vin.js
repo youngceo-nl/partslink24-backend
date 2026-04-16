@@ -45,18 +45,29 @@ async function captureVehicleImage(page, vin) {
     // Give the Scope panel time to render its base64 image layers.
     await page.waitForTimeout(2000);
 
-    // The exploded-view diagram is inside `_imageSelection_{hash}` — a
-    // unique wrapper that only exists on the graphical-nav view, so the
-    // selector is both stable across bundle rebuilds and precise enough
-    // to screenshot just the diagram (not the whole page).
-    const scope = page.locator('[class*="_imageSelection_"]').first();
-    const scopeVisible = await scope.isVisible({ timeout: 4000 }).catch(() => false);
-    if (!scopeVisible) return null;
+    // The catalog ships the exploded-view diagram as an inline base64 PNG
+    // (1403×992 ish) inside the selected `_imageSelection_` item. Grab the
+    // raw data URL — higher quality than a Playwright screenshot, and
+    // smaller on disk (no surrounding chrome/padding).
+    const dataUrl = await page.evaluate(() => {
+      const selected = document.querySelector(
+        '[class*="_imageSelection_"] [class*="_selected_"] img',
+      );
+      const any = document.querySelector('[class*="_imageSelection_"] img');
+      const img = selected ?? any;
+      return img?.src?.startsWith("data:image/") ? img.src : null;
+    });
+    if (!dataUrl) {
+      log.warn("partslink.vin.image_capture.no_data_url", { vin });
+      return null;
+    }
 
+    const b64 = dataUrl.split(",", 2)[1];
+    const buf = Buffer.from(b64, "base64");
     await fs.mkdir(VEHICLE_IMAGES_DIR, { recursive: true });
     const file = path.join(VEHICLE_IMAGES_DIR, `${vin}.png`);
-    await scope.screenshot({ path: file, omitBackground: false });
-    log.info("partslink.vin.image_captured", { vin, file });
+    await fs.writeFile(file, buf);
+    log.info("partslink.vin.image_captured", { vin, file, bytes: buf.length });
     return `/vehicle-images/${vin}.png`;
   } catch (err) {
     log.warn("partslink.vin.image_capture_failed", { vin, message: err.message });
