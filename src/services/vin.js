@@ -175,9 +175,39 @@ function validateVin(vin) {
   return vin.toUpperCase();
 }
 
-async function decodeVin(rawVin, { brand: explicitBrand } = {}) {
+// In-memory cache of decoded VINs. Each decode costs ~10-15s (Playwright
+// navigation + PartsLink24's LOADING splash + graphical-nav capture), so
+// caching the results makes repeat lookups instant. VIN→vehicle data is
+// effectively immutable for the life of a vehicle, but we TTL the cache
+// so stale data from a broken catalog page eventually retries.
+const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+const decodeCache = new Map();
+
+function cacheGet(vin) {
+  const e = decodeCache.get(vin);
+  if (!e) return null;
+  if (Date.now() - e.at > CACHE_TTL_MS) {
+    decodeCache.delete(vin);
+    return null;
+  }
+  return e.result;
+}
+
+function cacheSet(vin, result) {
+  decodeCache.set(vin, { at: Date.now(), result });
+}
+
+async function decodeVin(rawVin, { brand: explicitBrand, refresh = false } = {}) {
   const vin = validateVin(rawVin);
   const hintedBrand = explicitBrand ?? brandForVin(vin);
+
+  if (!refresh) {
+    const cached = cacheGet(vin);
+    if (cached) {
+      log.info("partslink.vin.cache_hit", { vin });
+      return { ...cached, meta: { ...(cached.meta ?? {}), cached: true } };
+    }
+  }
 
   const login = await ensureLoggedIn();
 
@@ -220,7 +250,7 @@ async function decodeVin(rawVin, { brand: explicitBrand } = {}) {
       const imagePath = await captureVehicleImage(page, vin);
 
       log.info("partslink.vin.decoded", { vin, brand: hintedBrand, parsed, imagePath });
-      return {
+      const result = {
         vin,
         brand: hintedBrand,
         make: meta.breadcrumb,
@@ -251,6 +281,10 @@ async function decodeVin(rawVin, { brand: explicitBrand } = {}) {
           sessionReused: login.sessionReused,
         },
       };
+      // Only cache successful decodes (resolved == true) so we retry
+      // transient failures on the next call.
+      if (result.meta.resolved) cacheSet(vin, result);
+      return result;
     } catch (err) {
       const screenshot = await captureFailure(page, `vin-global`);
       log.error("partslink.vin.decode.failed", { vin, message: err.message, screenshot });
