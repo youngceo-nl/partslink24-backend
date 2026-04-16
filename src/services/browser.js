@@ -45,6 +45,14 @@ async function ensureBrowser() {
     context.setDefaultNavigationTimeout(config.browser.navTimeoutMs);
     context.setDefaultTimeout(config.browser.actionTimeoutMs);
 
+    // Block Usercentrics at the network layer — if their CDN scripts
+    // never load, the cookie banner can't render. DOM-removal approaches
+    // lost a race against Usercentrics' own re-injection.
+    await context.route(
+      /usercentrics\.(eu|com|org)|app\.usercentrics|uc-api/i,
+      (route) => route.abort(),
+    );
+
     // Auto-close handling — if the browser dies (process kill, crash),
     // reset state so the next request re-launches instead of hanging.
     browser.on("disconnected", () => {

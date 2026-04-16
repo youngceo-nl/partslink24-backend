@@ -131,10 +131,31 @@ async function ensureLoggedIn({ force = false } = {}) {
     // and marks the form ready. Playwright's fill() doesn't fire keyup so
     // we use pressSequentially() to simulate real key events. Also call
     // txtChanged() explicitly as a belt-and-braces measure.
-    await page.locator(SEL.companyId).pressSequentially(config.partslink24.companyId, { delay: 15 });
-    await page.locator(SEL.username).pressSequentially(config.partslink24.username, { delay: 15 });
-    await page.locator(SEL.password).pressSequentially(config.partslink24.accessCode, { delay: 15 });
+    // Slower typing (80ms/char) + explicit click for focus. 15ms caused
+    // character drops because the form's onkeyup="txtChanged()" ran on
+    // each stroke and occasionally stole focus between presses —
+    // credentials came through truncated ("nl-62" instead of "nl-620935")
+    // and PartsLink24 rejected them as "invalid". This is slower but
+    // reliable; total add to login time is ~2 seconds.
+    for (const [sel, val] of [
+      [SEL.companyId, config.partslink24.companyId],
+      [SEL.username, config.partslink24.username],
+      [SEL.password, config.partslink24.accessCode],
+    ]) {
+      await page.locator(sel).click();
+      await page.locator(sel).pressSequentially(val, { delay: 80 });
+    }
     await page.evaluate(() => { if (typeof txtChanged === "function") txtChanged(); });
+
+    // Usercentrics re-shows the banner asynchronously — dismiss again just
+    // before submitting so it doesn't swallow the click / steal focus. The
+    // JS API works whether or not the banner is currently visible.
+    await page.evaluate(() => {
+      const ui = window.UC_UI;
+      if (ui?.acceptAllConsents) ui.acceptAllConsents().catch(() => {});
+      else if (ui?.closeCMP) ui.closeCMP();
+    }).catch(() => {});
+    await page.waitForTimeout(400);
 
     // The login is AJAX — the submit button's onclick calls
     // `doLoginAjax(false)` and `return false`s on the form submit. Calling
