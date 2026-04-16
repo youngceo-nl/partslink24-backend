@@ -45,11 +45,11 @@ async function captureVehicleImage(page, vin) {
     // Give the Scope panel time to render its base64 image layers.
     await page.waitForTimeout(2000);
 
-    // The scope container class ends in a build-hash suffix (…_116af_16 in
-    // the current bundle). Match by prefix so it survives bundle rebuilds.
-    const scope = page.locator('[class*="_container_"][class*="_16"]').filter({
-      has: page.locator(".event-catcher"),
-    }).first();
+    // The exploded-view diagram is inside `_imageSelection_{hash}` — a
+    // unique wrapper that only exists on the graphical-nav view, so the
+    // selector is both stable across bundle rebuilds and precise enough
+    // to screenshot just the diagram (not the whole page).
+    const scope = page.locator('[class*="_imageSelection_"]').first();
     const scopeVisible = await scope.isVisible({ timeout: 4000 }).catch(() => false);
     if (!scopeVisible) return null;
 
