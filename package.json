@@ -1,5 +1,24 @@
 {
+  "name": "car-part-scraper",
+  "version": "0.1.0",
+  "private": true,
+  "description": "PartsLink24 browser-automation backend — VIN + part lookup over HTTP",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
+    "probe:login": "node scripts/probe-login.js",
+    "postinstall": "playwright install chromium"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.21.1",
     "playwright": "^1.59.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.7"
   }
 }
