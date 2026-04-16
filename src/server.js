@@ -29,18 +29,29 @@ app.use((req, res, next) => {
   next();
 });
 
-// Serve captured vehicle images from the Graphical Navigation panel. CORS
-// is wide-open because the intended consumer is the price-calculator
-// frontend running on a different origin, and these are not secrets —
-// they're derivations of a paid PartsLink24 subscription.
+// CORS + cache headers for the image static mounts below.
+const imageHeaders = (_req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Cache-Control", "public, max-age=86400");
+  next();
+};
+
+// Exploded-view diagrams captured from the Graphical Navigation panel,
+// keyed by VIN.
 app.use(
   "/vehicle-images",
-  (req, res, next) => {
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Cache-Control", "public, max-age=86400");
-    next();
-  },
+  imageHeaders,
   express.static(path.resolve(process.cwd(), "artifacts", "vehicle-images"), {
+    fallthrough: false,
+  }),
+);
+
+// Part-specific illustration canvases captured after drilling into a
+// search-result row, keyed by {brand}-{oem}.png.
+app.use(
+  "/part-images",
+  imageHeaders,
+  express.static(path.resolve(process.cwd(), "artifacts", "part-images"), {
     fallthrough: false,
   }),
 );
