@@ -218,8 +218,20 @@ async function decodeVin(rawVin, { brand: explicitBrand, refresh = false } = {})
       // "Attention" interstitial. Reuse cookies from ensureLoggedIn().
       await page.goto(config.partslink24.baseUrl, { waitUntil: "domcontentloaded" });
       // PartsLink24 shows a "LOADING..." splash post-login for a few seconds
-      // before rendering startup.do — wait generously for the VIN form.
-      await page.waitForSelector(GLOBAL_SEARCH.input, { timeout: 20_000 });
+      // before rendering startup.do. If the form doesn't render within 8s,
+      // we're probably actually logged out (the saved session cookies were
+      // invalidated by a concurrent web-UI login). Force a fresh login and
+      // retry once.
+      const formVisible = await page
+        .waitForSelector(GLOBAL_SEARCH.input, { timeout: 8000 })
+        .then(() => true)
+        .catch(() => false);
+      if (!formVisible) {
+        log.warn("partslink.vin.session_stale", { vin });
+        await ensureLoggedIn({ force: true });
+        await page.goto(config.partslink24.baseUrl, { waitUntil: "domcontentloaded" });
+        await page.waitForSelector(GLOBAL_SEARCH.input, { timeout: 20_000 });
+      }
 
       // Fill the VIN and trigger the page's own searchText() helper. The
       // form's onsubmit is prevented, so a normal submit won't fire.
