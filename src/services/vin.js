@@ -1,24 +1,38 @@
-// VIN → vehicle decode against PartsLink24 brand catalogs.
+// VIN → vehicle decode against PartsLink24.
 //
-// Flow:
-//   1. Map VIN WMI → PartsLink24 catalog slug (BMW, Audi, Mercedes, …).
-//   2. Ensure we're logged in.
-//   3. Launch the brand catalog and wait for the SPA to hydrate.
-//   4. If no dealer is selected the search inputs are disabled — surface a
-//      helpful `dealer_selection_required` error. Dealer selection is a
-//      one-time UI action per account and must happen through the web UI
-//      (this service does not automate it to avoid picking a wrong dealer).
-//   5. Fill the VIN, submit, wait for the vehicle-context panel to appear,
-//      and extract what the breadcrumb / companion panel exposes.
+// There are two VIN entry points on the portal:
+//   1. GLOBAL search on /partslink24/startup.do (a plain <form name="search-text">)
+//      — this is the cross-brand search; the portal routes you to the
+//      right catalog. We prefer this because it works even when we can't
+//      guess the brand, and it's available in demo accounts.
+//   2. Per-brand catalog's `vehicleSearchInput` — only enabled on accounts
+//      with an active subscription for that brand. Used as a fallback.
 //
-// Fields that aren't surfaced for a given brand come back as `null`.
+// Flow implemented here:
+//   1. Ensure we're logged in.
+//   2. Navigate to the portal root — the post-login root *is* startup.do,
+//      so no deep-link interstitial is triggered.
+//   3. Fill the VIN into `form[name="search-text"] input[name="text"]` and
+//      invoke the page-provided `searchText()` JS function.
+//   4. Wait for the brand catalog to load; extract the breadcrumb +
+//      companion panel for vehicle metadata.
 
+const config = require("../config");
 const log = require("../utils/logger");
 const { withPage } = require("./browser");
 const { ensureLoggedIn } = require("./partslink");
-const { openCatalog, dealerSelected, vinInputEnabled, isDemoMode, SEL } = require("./catalog");
 const { UpstreamError, ValidationError } = require("../utils/errors");
 const { captureFailure } = require("../utils/screenshot");
+
+const GLOBAL_SEARCH = {
+  input: 'form[name="search-text"] input[name="text"]',
+  submitFn: () => { if (typeof searchText === "function") searchText(); },
+};
+
+// Catalog SPA selectors (same across brands, see services/catalog.js).
+const CATALOG_SEL = {
+  breadcrumbBrand: '[data-test-id="breadcrumbCatalogName"]',
+};
 
 const VIN_REGEX = /^[A-HJ-NPR-Z0-9]{17}$/;
 
@@ -57,79 +71,65 @@ function validateVin(vin) {
 
 async function decodeVin(rawVin, { brand: explicitBrand } = {}) {
   const vin = validateVin(rawVin);
-  const brand = explicitBrand ?? brandForVin(vin);
-  if (!brand) {
-    throw new ValidationError(
-      `No PartsLink24 catalog known for VIN WMI "${vin.slice(0, 3)}" — pass an explicit 'brand' (e.g. "audi", "bmw", "mercedes").`,
-    );
-  }
+  const hintedBrand = explicitBrand ?? brandForVin(vin);
 
   const login = await ensureLoggedIn();
 
   return withPage(async (page) => {
     try {
-      await openCatalog(page, brand);
+      // Navigate to the authenticated portal root — post-login this resolves
+      // to /partslink24/startup.do without triggering the deep-link
+      // "Attention" interstitial. Reuse cookies from ensureLoggedIn().
+      await page.goto(config.partslink24.baseUrl, { waitUntil: "domcontentloaded" });
+      // PartsLink24 shows a "LOADING..." splash post-login for a few seconds
+      // before rendering startup.do — wait generously for the VIN form.
+      await page.waitForSelector(GLOBAL_SEARCH.input, { timeout: 20_000 });
 
-      if (!(await dealerSelected(page))) {
-        const screenshot = await captureFailure(page, `vin-no-dealer-${brand}`);
-        throw new UpstreamError("PartsLink24 catalog requires a dealer to be selected", {
-          brand, code: "dealer_selection_required", screenshot,
-        });
-      }
-
-      if (!(await vinInputEnabled(page))) {
-        const demo = await isDemoMode(page);
-        const screenshot = await captureFailure(page, `vin-disabled-${brand}`);
-        throw new UpstreamError(
-          demo
-            ? `PartsLink24 '${brand}' catalog is in demo mode — VIN search disabled. Activate the ${brand} subscription for account ${brand === "mercedes" ? "Mercedes" : brand}.`
-            : `PartsLink24 VIN input is disabled for brand '${brand}' — dealer may not be selected, or the account lacks search entitlement.`,
-          { brand, code: demo ? "demo_mode" : "vin_input_disabled", screenshot },
-        );
-      }
-
-      // Fill VIN + submit. The send button is a small icon (<span>) next to
-      // the input; pressing Enter on the input also triggers the search.
-      await page.locator(SEL.vinInput).first().fill(vin);
-      await Promise.race([
-        page.locator(SEL.vinInput).first().press("Enter"),
-        page.locator(SEL.vinSubmit).first().click({ trial: true }).catch(() => {}),
+      // Fill the VIN and trigger the page's own searchText() helper. The
+      // form's onsubmit is prevented, so a normal submit won't fire.
+      await page.locator(GLOBAL_SEARCH.input).first().fill(vin);
+      await Promise.all([
+        page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 20_000 }).catch(() => {}),
+        page.evaluate(GLOBAL_SEARCH.submitFn),
       ]);
       await page.waitForTimeout(2500);
 
-      // Read whatever breadcrumb / vehicle-summary information is on the page.
-      // The shape varies per brand — we dump the breadcrumb + companion text
-      // and let the caller decide how to interpret it.
+      // After submit the portal routes us to the matching brand's catalog
+      // SPA. Extract the breadcrumb + companion panel for vehicle metadata.
       const meta = await page.evaluate((sel) => {
         const text = (q) => document.querySelector(q)?.innerText?.trim() || null;
-        const breadcrumb = text(sel.breadcrumbBrand);
-        const companion = text('[data-test-id="companion"]');
-        return { breadcrumb, companion };
-      }, SEL);
+        return {
+          url: location.href,
+          title: document.title,
+          breadcrumb: text(sel.breadcrumbBrand),
+          companion: text('[data-test-id="companion"]'),
+        };
+      }, CATALOG_SEL);
 
-      log.info("partslink.vin.decoded", { vin, brand, meta });
+      log.info("partslink.vin.decoded", { vin, brand: hintedBrand, meta });
       return {
         vin,
-        brand,
-        // Brand-specific field extraction isn't wired yet — see README
-        // "Known limitations". The raw companion text is returned so callers
-        // can parse what PartsLink24 shows in the vehicle panel.
+        brand: hintedBrand,
+        // Per-brand structured parsers aren't wired yet — we surface the
+        // raw breadcrumb + companion text so callers can act on what the UI
+        // actually shows.
         make: meta.breadcrumb,
         model: null,
         year: null,
         trim: null,
         engine: null,
         meta: {
-          resolved: !!meta.companion,
+          resolved: !!meta.breadcrumb || !!meta.companion,
+          url: meta.url,
+          title: meta.title,
           companion: meta.companion,
           sessionReused: login.sessionReused,
         },
       };
     } catch (err) {
-      if (err.code === "dealer_selection_required") throw err;
-      const screenshot = await captureFailure(page, `vin-${brand}`);
-      log.error("partslink.vin.decode.failed", { vin, brand, message: err.message, screenshot });
-      throw new UpstreamError("VIN decode failed", { vin, brand, message: err.message, screenshot });
+      const screenshot = await captureFailure(page, `vin-global`);
+      log.error("partslink.vin.decode.failed", { vin, message: err.message, screenshot });
+      throw new UpstreamError("VIN decode failed", { vin, message: err.message, screenshot });
     }
   });
 }

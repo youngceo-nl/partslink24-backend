@@ -81,29 +81,91 @@ async function ensureLoggedIn({ force = false } = {}) {
     // render before filling.
     await page.waitForSelector(SEL.companyId, { timeout: config.browser.actionTimeoutMs });
 
+    // Usercentrics cookie overlay intercepts pointer events on the login
+    // inputs — dismiss it first.
+    const cookieBtn = page.locator('#usercentrics-root button[data-testid="uc-accept-all-button"]').first();
+    if (await cookieBtn.isVisible({ timeout: 1500 }).catch(() => false)) {
+      await cookieBtn.click().catch(() => {});
+      await page.waitForTimeout(400);
+    }
+
     log.info("partslink.login.submitting");
-    await page.fill(SEL.companyId, config.partslink24.companyId);
-    await page.fill(SEL.username, config.partslink24.username);
-    await page.fill(SEL.password, config.partslink24.accessCode);
+    // Each field has onkeyup="txtChanged()" which enables the login button
+    // and marks the form ready. Playwright's fill() doesn't fire keyup so
+    // we use pressSequentially() to simulate real key events. Also call
+    // txtChanged() explicitly as a belt-and-braces measure.
+    await page.locator(SEL.companyId).pressSequentially(config.partslink24.companyId, { delay: 15 });
+    await page.locator(SEL.username).pressSequentially(config.partslink24.username, { delay: 15 });
+    await page.locator(SEL.password).pressSequentially(config.partslink24.accessCode, { delay: 15 });
+    await page.evaluate(() => { if (typeof txtChanged === "function") txtChanged(); });
 
-    await Promise.all([
-      page.waitForLoadState("domcontentloaded"),
-      page.click(SEL.submit).catch(async () => {
-        // Fallback — the hidden-login submit is 1×1 px. Trigger form submit.
-        await page.evaluate(() => document.forms["loginForm"]?.submit());
-      }),
-    ]);
+    // The login is AJAX — the submit button's onclick calls
+    // `doLoginAjax(false)` and `return false`s on the form submit. Calling
+    // `form.submit()` bypasses the real login, so we invoke the page-
+    // provided function and then wait for the portal to redirect us.
+    await page.evaluate(() => {
+      if (typeof doLoginAjax === "function") doLoginAjax(false);
+      else document.forms["loginForm"]?.submit();
+    });
 
-    // Wait for either redirect to portal or an error banner.
+    // Wait for either the AJAX redirect (URL changes away from /login.do),
+    // the session-squeeze-out prompt (already-logged-in elsewhere), or an
+    // error in #loginErrorDiv.
+    await page.waitForFunction(
+      () => {
+        const err = document.querySelector("#loginErrorDiv");
+        const hasError = err && err.innerText && err.innerText.trim().length > 0;
+        const squeeze = document.querySelector("#sessionSqueezeOutPrompt");
+        const squeezeVisible = squeeze && getComputedStyle(squeeze).display !== "none";
+        const offLogin = !location.pathname.includes("/login.do");
+        return offLogin || hasError || squeezeVisible;
+      },
+      undefined,
+      { timeout: config.browser.navTimeoutMs },
+    ).catch(() => {});
+
+    // Handle the "you're already logged in elsewhere" prompt by confirming
+    // — this calls doLoginAjax(true) which kills the stale session.
+    const squeezeVisible = await page.evaluate(() => {
+      const s = document.querySelector("#sessionSqueezeOutPrompt");
+      return !!s && getComputedStyle(s).display !== "none";
+    }).catch(() => false);
+    if (squeezeVisible) {
+      log.info("partslink.login.squeezeout_confirm");
+      await page.evaluate(() => {
+        if (typeof doLoginAjax === "function") doLoginAjax(true);
+      });
+      await page.waitForFunction(
+        () => !location.pathname.includes("/login.do"),
+        undefined,
+        { timeout: config.browser.navTimeoutMs },
+      ).catch(() => {});
+    }
+
     await page.waitForTimeout(1500);
 
-    if (!(await isLoggedIn(page))) {
-      const errText = await page.locator(SEL.errorBanner).first().innerText().catch(() => null);
+    // Read any error message, then verify by navigating to root and
+    // checking the portal renders (has VIN search form).
+    const errText = await page
+      .locator("#loginErrorDiv").first().innerText()
+      .then((s) => s?.trim() || null)
+      .catch(() => null);
+
+    // PartsLink24 shows a "LOADING..." splash after successful login that
+    // can take 5-10s to transition to startup.do. Give it room.
+    await page.goto(config.partslink24.baseUrl, { waitUntil: "domcontentloaded" });
+    const reallyLoggedIn = await page
+      .locator('form[name="search-text"] input[name="text"]').first()
+      .waitFor({ state: "visible", timeout: 20_000 })
+      .then(() => true)
+      .catch(() => false);
+
+    if (!reallyLoggedIn) {
       const screenshot = await captureFailure(page, "login-failed");
       log.error("partslink.login.failed", { errText, screenshot, url: page.url() });
       throw new UpstreamError("PartsLink24 login failed", {
         url: page.url(),
-        message: errText ?? "unknown",
+        message: errText || "credentials may be incorrect or session was rejected",
         screenshot,
       });
     }

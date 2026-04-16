@@ -1,25 +1,25 @@
-// Part-number lookup against PartsLink24 brand catalogs.
+// Part-number lookup against PartsLink24.
 //
-// Flow:
-//   1. Resolve the brand (either explicit or via VIN WMI).
-//   2. Ensure login.
-//   3. Open the brand catalog.
-//   4. If a VIN was supplied, enter it first so the catalog narrows results
-//      to that vehicle's parts. If no VIN, the part search runs across the
-//      whole catalog.
-//   5. Enter the part number, submit, wait for the results list, and extract
-//      the first result's metadata.
-//
-// Same dealer-selection constraint as VIN decoding — if no dealer is set the
-// search inputs are disabled and we fail fast.
+// We reuse the same entry path that VIN decode uses (the global search on
+// /partslink24/startup.do). When a VIN is supplied, entering it routes us
+// to the matching brand catalog; within that catalog the partSearchInput
+// is enabled on demo accounts (unlike the VIN input which is gated). When
+// only a brand is supplied we open the catalog directly.
 
+const config = require("../config");
 const log = require("../utils/logger");
 const { withPage } = require("./browser");
 const { ensureLoggedIn } = require("./partslink");
-const { openCatalog, dealerSelected, vinInputEnabled, isDemoMode, SEL } = require("./catalog");
 const { brandForVin, validateVin } = require("./vin");
 const { UpstreamError, ValidationError } = require("../utils/errors");
 const { captureFailure } = require("../utils/screenshot");
+
+const GLOBAL_VIN_INPUT = 'form[name="search-text"] input[name="text"]';
+const PART_INPUT = '[data-test-id="partSearchInput"] input';
+const PART_SUBMIT = '[data-test-id="sendPartSearch"]';
+const BRAND_BREADCRUMB = '[data-test-id="breadcrumbCatalogName"]';
+const CATALOG_URL = (brand) =>
+  `${config.partslink24.baseUrl}/partslink24/launchCatalog.do?service=${encodeURIComponent(`${brand}_parts`)}`;
 
 function normalizePartNumber(raw) {
   if (typeof raw !== "string" || raw.trim() === "") {
@@ -46,72 +46,100 @@ async function lookupPart({ vin, brand, partNumber }) {
 
   return withPage(async (page) => {
     try {
-      await openCatalog(page, effectiveBrand);
+      if (vin) {
+        const valid = validateVin(vin);
+        // Route via the global VIN search — this lands us in the right
+        // brand catalog without us having to guess the slug.
+        await page.goto(config.partslink24.baseUrl, { waitUntil: "domcontentloaded" });
+        await page.waitForSelector(GLOBAL_VIN_INPUT, { timeout: 20_000 });
+        await page.locator(GLOBAL_VIN_INPUT).first().fill(valid);
+        await Promise.all([
+          page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 20_000 }).catch(() => {}),
+          page.evaluate(() => { if (typeof searchText === "function") searchText(); }),
+        ]);
+      } else {
+        // No VIN — open the brand catalog directly.
+        await page.goto(CATALOG_URL(effectiveBrand), { waitUntil: "domcontentloaded" });
+      }
 
-      if (!(await dealerSelected(page))) {
-        const screenshot = await captureFailure(page, `part-no-dealer-${effectiveBrand}`);
-        throw new UpstreamError("PartsLink24 catalog requires a dealer to be selected", {
-          brand: effectiveBrand, code: "dealer_selection_required", screenshot,
+      // Wait for the catalog SPA to hydrate.
+      await page.waitForSelector(BRAND_BREADCRUMB, { timeout: 20_000 }).catch(() => {});
+
+      // Dealer-gate: PartsLink24 hides the part-search input until a dealer
+      // is selected. The input is present in the DOM but `visibility:hidden`
+      // until dealer selection. We detect that state and surface a clear
+      // error. Dealer selection is a one-time user action via the web UI
+      // (we don't auto-pick one since the wrong dealer affects order flows).
+      const partVisible = await page.locator(PART_INPUT).first()
+        .isVisible({ timeout: 6000 }).catch(() => false);
+      if (!partVisible) {
+        const needsDealer = await page.evaluate(() => {
+          const byText = Array.from(document.querySelectorAll("button"))
+            .some((b) => /select dealer|dealer selecteren/i.test(b.innerText || ""));
+          const byTestId = !!document.querySelector('[data-test-id*="Dealer"], [data-test-id*="dealer"]');
+          return byText || byTestId;
+        }).catch(() => false);
+        const screenshot = await captureFailure(page, `part-gated-${effectiveBrand}`);
+        const msg = needsDealer
+          ? "PartsLink24 requires a dealer to be selected before part search is available. Sign in via the web UI and pick a default dealer once."
+          : "Part-search input is hidden — the catalog UI state prevents automated search (dealer/vehicle context missing).";
+        throw new UpstreamError(msg, {
+          brand: effectiveBrand,
+          code: needsDealer ? "dealer_selection_required" : "part_input_hidden",
+          screenshot,
         });
       }
 
-      if (!(await vinInputEnabled(page))) {
-        const demo = await isDemoMode(page);
-        const screenshot = await captureFailure(page, `part-disabled-${effectiveBrand}`);
-        throw new UpstreamError(
-          demo
-            ? `PartsLink24 '${effectiveBrand}' catalog is in demo mode — part search disabled. Activate the ${effectiveBrand} subscription.`
-            : `PartsLink24 search inputs are disabled for brand '${effectiveBrand}' — dealer may not be selected, or the account lacks search entitlement.`,
-          { brand: effectiveBrand, code: demo ? "demo_mode" : "inputs_disabled", screenshot },
-        );
+      // Dismiss cookie banner if it showed up inside the catalog.
+      const cookieBtn = page.locator('#usercentrics-root button[data-testid="uc-accept-all-button"]').first();
+      if (await cookieBtn.isVisible({ timeout: 1000 }).catch(() => false)) {
+        await cookieBtn.click().catch(() => {});
+        await page.waitForTimeout(400);
       }
 
-      // Optional VIN context — narrows the part search to one vehicle.
-      if (vin) {
-        const valid = validateVin(vin);
-        await page.locator(SEL.vinInput).first().fill(valid);
-        await page.locator(SEL.vinInput).first().press("Enter");
-        await page.waitForTimeout(2000);
-      }
+      // The part search icon (sendPartSearch) is a decorative span, not a
+      // clickable button — the real trigger is Enter on the input.
+      await page.locator(PART_INPUT).first().fill(partNo);
+      await page.locator(PART_INPUT).first().press("Enter");
+      await page.waitForTimeout(3000);
 
-      // Now perform the part-number search.
-      await page.locator(SEL.partInput).first().fill(partNo);
-      await page.locator(SEL.partInput).first().press("Enter");
-      await page.waitForTimeout(2500);
-
-      // Extract best-effort result. PartsLink24 renders results in a
-      // companion panel; the exact shape varies per brand. We return the
-      // raw text + any image src we can find so callers get something
-      // actionable even before per-brand extractors exist.
+      // Best-effort extraction from the result area. Shape varies per brand
+      // so we surface the companion panel's text and first non-SVG image.
       const result = await page.evaluate(() => {
         const visible = (el) => {
           const r = el.getBoundingClientRect();
           return r.width > 0 && r.height > 0;
         };
         const companion = document.querySelector('[data-test-id="companion"]');
-        const img = Array.from(document.querySelectorAll('img'))
+        const img = Array.from(document.querySelectorAll("img"))
           .filter(visible)
           .filter((i) => i.src && !i.src.endsWith(".svg") && i.naturalWidth > 80)
           .map((i) => i.src)[0] || null;
-        const bodyText = (companion?.innerText || "").replace(/\s+/g, " ").trim().slice(0, 1200);
-        return { companionText: bodyText, imageUrl: img };
+        return {
+          url: location.href,
+          title: document.title,
+          brandBreadcrumb: document.querySelector('[data-test-id="breadcrumbCatalogName"]')?.innerText?.trim() || null,
+          companionText: (companion?.innerText || "").replace(/\s+/g, " ").trim().slice(0, 1500),
+          imageUrl: img,
+        };
       });
 
       log.info("partslink.part.lookup.ok", {
-        brand: effectiveBrand, partNo, hasImage: !!result.imageUrl,
+        brand: effectiveBrand, partNo, url: result.url, hasImage: !!result.imageUrl,
       });
 
       return {
         partNumber: partNo,
         brand: effectiveBrand,
         vin: vin ?? null,
-        name: null,
+        name: result.brandBreadcrumb,
         description: result.companionText || null,
         imageUrl: result.imageUrl,
         category: null,
         compatibleVehicles: [],
         meta: {
-          resolved: !!result.companionText,
+          resolved: !!result.companionText || !!result.imageUrl,
+          url: result.url,
           sessionReused: login.sessionReused,
         },
       };
