@@ -51,7 +51,17 @@ async function lookupPart({ vin, brand, partNumber }) {
         // Route via the global VIN search — this lands us in the right
         // brand catalog without us having to guess the slug.
         await page.goto(config.partslink24.baseUrl, { waitUntil: "domcontentloaded" });
-        await page.waitForSelector(GLOBAL_VIN_INPUT, { timeout: 20_000 });
+        const formVisible = await page
+          .waitForSelector(GLOBAL_VIN_INPUT, { timeout: 8000 })
+          .then(() => true)
+          .catch(() => false);
+        if (!formVisible) {
+          // Session expired — force re-login and retry the navigation.
+          log.warn("partslink.part.session_stale", { partNo, brand: effectiveBrand });
+          await ensureLoggedIn({ force: true });
+          await page.goto(config.partslink24.baseUrl, { waitUntil: "domcontentloaded" });
+          await page.waitForSelector(GLOBAL_VIN_INPUT, { timeout: 20_000 });
+        }
         await page.locator(GLOBAL_VIN_INPUT).first().fill(valid);
         await Promise.all([
           page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 20_000 }).catch(() => {}),
