@@ -1,0 +1,28 @@
+# DigitalOcean App Platform spec. Create the app once with:
+#   doctl apps create --spec .do/app.yaml
+# ...or paste this into the "App Spec" field in the DO web console.
+#
+# Secrets (PARTSLINK24_*) must be supplied separately as encrypted env vars
+# via the console or `doctl apps update` — they are NOT in this file.
+
+name: car-part-scraper
+region: ams
+
+services:
+  - name: api
+    github:
+      repo: essencesoftwaredevelopment/car-part-scraper
+      branch: main
+      deploy_on_push: true
+    build_command: npm install
+    run_command: npm start
+    http_port: 3000
+    instance_size_slug: basic-s  # 1 vCPU, 1 GB — chromium needs the headroom
+    instance_count: 1
+    envs:
+      - key: HEADLESS
+        value: "true"
+      - key: PORT
+        value: "3000"
+      # The three PARTSLINK24_* vars must be added as SECRET-type env vars
+      # in the App Platform console after first deploy.
