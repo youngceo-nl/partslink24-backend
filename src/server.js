@@ -1,6 +1,7 @@
 // HTTP entrypoint. Loads env, starts Express, wires graceful shutdown so the
 // Playwright browser closes on SIGTERM (important for DigitalOcean restarts).
 
+const path = require("node:path");
 const express = require("express");
 const config = require("./config");
 const log = require("./utils/logger");
@@ -27,6 +28,22 @@ app.use((req, res, next) => {
   });
   next();
 });
+
+// Serve captured vehicle images from the Graphical Navigation panel. CORS
+// is wide-open because the intended consumer is the price-calculator
+// frontend running on a different origin, and these are not secrets —
+// they're derivations of a paid PartsLink24 subscription.
+app.use(
+  "/vehicle-images",
+  (req, res, next) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Cache-Control", "public, max-age=86400");
+    next();
+  },
+  express.static(path.resolve(process.cwd(), "artifacts", "vehicle-images"), {
+    fallthrough: false,
+  }),
+);
 
 app.use(routes);
 

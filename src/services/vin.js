@@ -17,12 +17,52 @@
 //   4. Wait for the brand catalog to load; extract the breadcrumb +
 //      companion panel for vehicle metadata.
 
+const fs = require("node:fs/promises");
+const path = require("node:path");
 const config = require("../config");
 const log = require("../utils/logger");
 const { withPage } = require("./browser");
 const { ensureLoggedIn } = require("./partslink");
 const { UpstreamError, ValidationError } = require("../utils/errors");
 const { captureFailure } = require("../utils/screenshot");
+
+// Screenshots of the Graphical Navigation panel, keyed by VIN. Served as
+// static images by server.js so the frontend can <img src=…> them.
+const VEHICLE_IMAGES_DIR = path.resolve(process.cwd(), "artifacts", "vehicle-images");
+
+// Capture the Scope-panel assembly (the exploded-view diagram of the car)
+// and write it to artifacts/vehicle-images/{vin}.png. Returns a URL path
+// like `/vehicle-images/{vin}.png` that the caller can hand to the client
+// (the Express server mounts the dir at that path). Never throws — a
+// missing image shouldn't break the decode flow.
+async function captureVehicleImage(page, vin) {
+  try {
+    const trigger = page.locator('[aria-label="Graphical Navigation"]').first();
+    const hasTrigger = await trigger.isVisible({ timeout: 4000 }).catch(() => false);
+    if (!hasTrigger) return null;
+
+    await trigger.click();
+    // Give the Scope panel time to render its base64 image layers.
+    await page.waitForTimeout(2000);
+
+    // The scope container class ends in a build-hash suffix (…_116af_16 in
+    // the current bundle). Match by prefix so it survives bundle rebuilds.
+    const scope = page.locator('[class*="_container_"][class*="_16"]').filter({
+      has: page.locator(".event-catcher"),
+    }).first();
+    const scopeVisible = await scope.isVisible({ timeout: 4000 }).catch(() => false);
+    if (!scopeVisible) return null;
+
+    await fs.mkdir(VEHICLE_IMAGES_DIR, { recursive: true });
+    const file = path.join(VEHICLE_IMAGES_DIR, `${vin}.png`);
+    await scope.screenshot({ path: file, omitBackground: false });
+    log.info("partslink.vin.image_captured", { vin, file });
+    return `/vehicle-images/${vin}.png`;
+  } catch (err) {
+    log.warn("partslink.vin.image_capture_failed", { vin, message: err.message });
+    return null;
+  }
+}
 
 const GLOBAL_SEARCH = {
   input: 'form[name="search-text"] input[name="text"]',
@@ -147,7 +187,13 @@ async function decodeVin(rawVin, { brand: explicitBrand } = {}) {
       }, CATALOG_SEL);
 
       const parsed = parseCompanion(meta.companion);
-      log.info("partslink.vin.decoded", { vin, brand: hintedBrand, parsed });
+
+      // Capture the exploded-view diagram from Graphical Navigation. Best
+      // effort — if the element isn't there (catalog still loading, or
+      // this brand doesn't expose one) we simply return null.
+      const imagePath = await captureVehicleImage(page, vin);
+
+      log.info("partslink.vin.decoded", { vin, brand: hintedBrand, parsed, imagePath });
       return {
         vin,
         brand: hintedBrand,
@@ -170,6 +216,7 @@ async function decodeVin(rawVin, { brand: explicitBrand } = {}) {
         roofColor: parsed.roofColor ?? null,
         carpetColor: parsed.carpetColor ?? null,
         seatCombination: parsed.seatCombination ?? null,
+        vehicleImageUrl: imagePath,
         meta: {
           resolved: !!meta.breadcrumb || !!meta.companion,
           url: meta.url,
