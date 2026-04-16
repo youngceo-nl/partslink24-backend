@@ -37,13 +37,24 @@ const VEHICLE_IMAGES_DIR = path.resolve(process.cwd(), "artifacts", "vehicle-ima
 // missing image shouldn't break the decode flow.
 async function captureVehicleImage(page, vin) {
   try {
-    const trigger = page.locator('[aria-label="Graphical Navigation"]').first();
-    const hasTrigger = await trigger.isVisible({ timeout: 4000 }).catch(() => false);
-    if (!hasTrigger) return null;
+    // The Graphical Navigation panel may already be open from the previous
+    // page state — only click the toggle when the image pane isn't rendered
+    // yet. Otherwise clicking would *close* it.
+    const alreadyOpen = await page
+      .locator('[class*="_imageSelection_"] img').first()
+      .isVisible({ timeout: 500 }).catch(() => false);
 
-    await trigger.click();
+    if (!alreadyOpen) {
+      const trigger = page.locator('[aria-label="Graphical Navigation"]').first();
+      const hasTrigger = await trigger.isVisible({ timeout: 8000 }).catch(() => false);
+      if (!hasTrigger) {
+        log.warn("partslink.vin.image_capture.no_trigger", { vin, url: page.url() });
+        return null;
+      }
+      await trigger.click();
+    }
     // Give the Scope panel time to render its base64 image layers.
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(2500);
 
     // The catalog ships the exploded-view diagram as an inline base64 PNG
     // (1403×992 ish) inside the selected `_imageSelection_` item. Grab the
