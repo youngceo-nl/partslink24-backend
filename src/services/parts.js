@@ -150,14 +150,20 @@ async function lookupPart({ vin, brand, partNumber }) {
       if (first) {
         await page.locator('[data-test-id="row"]').first().click().catch(() => {});
         // Give the <imageserver-weco> web component + its canvas time to
-        // render. Poll for the shadow-root canvas rather than a fixed wait.
+        // render. The canvas is sized before it's drawn into, so waiting
+        // for width/height isn't enough — poll until the dataURL exceeds
+        // the known "blank" size (an empty same-dim canvas is <3 KB base64
+        // vs. ~120 KB when the diagram is drawn).
         const canvasData = await page.waitForFunction(() => {
           const host = document.querySelector("imageserver-weco");
           const c = host?.shadowRoot?.querySelector("canvas.draw-target")
             || host?.shadowRoot?.querySelector("canvas");
-          if (c && c.width > 50 && c.height > 50) return c.toDataURL("image/png");
-          return null;
-        }, undefined, { timeout: 15_000 })
+          if (!c || c.width < 50 || c.height < 50) return null;
+          const url = c.toDataURL("image/png");
+          // A blank transparent/white canvas is ~5-10KB; real diagrams are
+          // 50KB+. Require >=15KB base64 to be confident pixels are drawn.
+          return url.length > 15_000 ? url : null;
+        }, undefined, { timeout: 20_000, polling: 500 })
           .then((h) => h.jsonValue())
           .catch(() => null);
 
