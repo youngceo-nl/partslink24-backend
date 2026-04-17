@@ -72,6 +72,31 @@ app.use((err, req, res, next) => {
 
 const server = app.listen(config.port, () => {
   log.info("server.listening", { port: config.port, headless: config.browser.headless });
+
+  // Pre-warm: login immediately on boot so the first real request doesn't
+  // pay the 15-20s login cost. Also start a keep-alive interval that pings
+  // the portal every 5 minutes to prevent server-side session expiry.
+  const { ensureLoggedIn } = require("./services/partslink");
+  const { withPage } = require("./services/browser");
+  const KEEPALIVE_MS = 5 * 60 * 1000;
+
+  ensureLoggedIn()
+    .then(() => log.info("server.prewarm.done"))
+    .catch((err) => log.warn("server.prewarm.failed", { message: err.message }));
+
+  setInterval(async () => {
+    try {
+      await withPage(async (page) => {
+        await page.goto(config.partslink24.baseUrl, {
+          waitUntil: "domcontentloaded",
+          timeout: 15_000,
+        });
+      });
+      log.info("server.keepalive.ok");
+    } catch (err) {
+      log.warn("server.keepalive.failed", { message: err.message });
+    }
+  }, KEEPALIVE_MS);
 });
 
 async function gracefulShutdown(signal) {
