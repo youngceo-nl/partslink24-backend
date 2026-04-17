@@ -37,52 +37,49 @@ const VEHICLE_IMAGES_DIR = path.resolve(process.cwd(), "artifacts", "vehicle-ima
 // missing image shouldn't break the decode flow.
 async function captureVehicleImage(page, vin) {
   try {
-    // The Graphical Navigation panel may already be open from the previous
-    // page state — only click the toggle when the image pane isn't rendered
-    // yet. Otherwise clicking would *close* it.
+    // The vehicle image lives inside .hotspots-captions-parent. If it's
+    // not visible yet, click the "Grafische navigatie" toggle to open it.
     const alreadyOpen = await page
-      .locator('[class*="_imageSelection_"] img').first()
-      .isVisible({ timeout: 500 }).catch(() => false);
+      .locator(".hotspots-captions-parent").first()
+      .isVisible({ timeout: 1500 }).catch(() => false);
 
     if (!alreadyOpen) {
-      // Short timeout — when the trigger exists it's already in the DOM
-      // within ~1s of the catalog rendering. A long wait only slows down
-      // decodes for vehicles whose catalog has no graphical-nav (US VINs,
-      // demo-only brands) where we want to return quickly with a null.
-      const trigger = page.locator('[aria-label="Graphical Navigation"]').first();
-      const hasTrigger = await trigger.isVisible({ timeout: 2500 }).catch(() => false);
+      // The trigger button uses aria-label "Grafische navigatie" (Dutch)
+      // or has the icon--images class inside a _headerIconEmphasized_ div.
+      const trigger = page.locator(
+        '[aria-label="Grafische navigatie"], ' +
+        '[aria-label="Graphical Navigation"], ' +
+        '._headerIconEmphasized_zjkrf_198 .icon--images, ' +
+        '[class*="_headerIconEmphasized_"] .icon--images',
+      ).first();
+      const hasTrigger = await trigger.isVisible({ timeout: 4000 }).catch(() => false);
       if (!hasTrigger) {
         log.warn("partslink.vin.image_capture.no_trigger", { vin, url: page.url() });
         return null;
       }
       await trigger.click();
+      // Wait for the hotspots panel to render after clicking.
+      await page.locator(".hotspots-captions-parent").first()
+        .waitFor({ state: "visible", timeout: 5000 }).catch(() => {});
     }
-    // Give the Scope panel time to render its base64 image layers.
+
+    // Give the panel time to fully render its image layers.
     await page.waitForTimeout(2000);
 
-    // The catalog ships the exploded-view diagram as an inline base64 PNG
-    // (1403×992 ish) inside the selected `_imageSelection_` item. Grab the
-    // raw data URL — higher quality than a Playwright screenshot, and
-    // smaller on disk (no surrounding chrome/padding).
-    const dataUrl = await page.evaluate(() => {
-      const selected = document.querySelector(
-        '[class*="_imageSelection_"] [class*="_selected_"] img',
-      );
-      const any = document.querySelector('[class*="_imageSelection_"] img');
-      const img = selected ?? any;
-      return img?.src?.startsWith("data:image/") ? img.src : null;
-    });
-    if (!dataUrl) {
-      log.warn("partslink.vin.image_capture.no_data_url", { vin });
+    // Screenshot the .hotspots-captions-parent element which contains
+    // the exploded-view diagram of the vehicle.
+    const el = page.locator(".hotspots-captions-parent").first();
+    const isVisible = await el.isVisible().catch(() => false);
+    if (!isVisible) {
+      log.warn("partslink.vin.image_capture.panel_not_visible", { vin });
       return null;
     }
 
-    const b64 = dataUrl.split(",", 2)[1];
-    const buf = Buffer.from(b64, "base64");
     await fs.mkdir(VEHICLE_IMAGES_DIR, { recursive: true });
     const file = path.join(VEHICLE_IMAGES_DIR, `${vin}.png`);
-    await fs.writeFile(file, buf);
-    log.info("partslink.vin.image_captured", { vin, file, bytes: buf.length });
+    await el.screenshot({ path: file });
+    const stat = await fs.stat(file);
+    log.info("partslink.vin.image_captured", { vin, file, bytes: stat.size });
     return `/vehicle-images/${vin}.png`;
   } catch (err) {
     log.warn("partslink.vin.image_capture_failed", { vin, message: err.message });
