@@ -57,34 +57,155 @@ async function hasSessionFile() {
   }
 }
 
-// Circuit breaker: PartsLink24 locks the account after repeated failed
-// logins. If a login just failed with "credentials invalid" we cool off
-// before attempting another one — otherwise every incoming request would
-// trigger another login attempt and extend the lockout.
-const LOGIN_COOLDOWN_MS = 15 * 60 * 1000; // 15 minutes
-let lastLoginFailureAt = 0;
+// Track the last login failure for diagnostics only — no cooldown.
+// Every incoming request gets a fresh login attempt if the session is stale.
 let lastLoginFailureMessage = null;
 
-function loginOnCooldown() {
-  return Date.now() - lastLoginFailureAt < LOGIN_COOLDOWN_MS;
+/**
+ * Dismiss any cookie banners or consent overlays on the page.
+ * Handles Usercentrics (UC_UI JS API + button click) and generic
+ * cookie/consent overlays that might block interaction.
+ */
+async function dismissOverlays(page) {
+  // 1. Usercentrics JS API — works whether or not the banner is visible.
+  await page.evaluate(() => {
+    const ui = window.UC_UI;
+    if (ui?.acceptAllConsents) ui.acceptAllConsents().catch(() => {});
+    else if (ui?.closeCMP) ui.closeCMP();
+  }).catch(() => {});
+  await page.waitForTimeout(300);
+
+  // 2. Force-click any Usercentrics accept button still in the DOM.
+  const ucBtn = page.locator(
+    'button[data-testid="uc-accept-all-button"], [data-testid="uc-container"] button',
+  ).first();
+  if (await ucBtn.count() > 0) {
+    await ucBtn.click({ force: true, timeout: 2000 }).catch(() => {});
+    await page.waitForTimeout(300);
+  }
+
+  // 3. Generic cookie/consent overlays — accept or close buttons with
+  //    common labels. Force-click so overlays behind other overlays don't
+  //    block the action.
+  for (const selector of [
+    'button:has-text("Accept")',
+    'button:has-text("Accepteren")',
+    'button:has-text("Akzeptieren")',
+    'button:has-text("Accept all")',
+    'a:has-text("Accept")',
+    '[class*="cookie"] button',
+    '[class*="consent"] button',
+    '[id*="cookie"] button',
+    '[id*="consent"] button',
+  ]) {
+    const btn = page.locator(selector).first();
+    if (await btn.isVisible({ timeout: 300 }).catch(() => false)) {
+      await btn.click({ force: true, timeout: 2000 }).catch(() => {});
+      await page.waitForTimeout(200);
+      break;
+    }
+  }
 }
-function loginCooldownRemainingMs() {
-  return Math.max(0, LOGIN_COOLDOWN_MS - (Date.now() - lastLoginFailureAt));
+
+/**
+ * Handle the "you're already logged in elsewhere" session squeeze-out
+ * prompt. Confirms the takeover so the stale session is killed.
+ * Returns true if the prompt was found and handled.
+ */
+async function handleSqueezeOut(page) {
+  const squeezeVisible = await page.evaluate(() => {
+    const s = document.querySelector("#sessionSqueezeOutPrompt");
+    return !!s && getComputedStyle(s).display !== "none";
+  }).catch(() => false);
+
+  if (!squeezeVisible) return false;
+
+  log.info("partslink.login.squeezeout_confirm");
+  await page.evaluate(() => {
+    if (typeof doLoginAjax === "function") doLoginAjax(true);
+  });
+  await page.waitForFunction(
+    () => !location.pathname.includes("/login.do"),
+    undefined,
+    { timeout: config.browser.navTimeoutMs },
+  ).catch(() => {});
+  return true;
+}
+
+/**
+ * Fill and submit the login form. Waits for the page to leave /login.do
+ * (success) or for an error to appear (failure). Returns { success, errText }.
+ */
+async function fillAndSubmitLogin(page) {
+  await page.waitForSelector(SEL.companyId, { timeout: config.browser.actionTimeoutMs });
+  await dismissOverlays(page);
+
+  log.info("partslink.login.submitting");
+
+  // fill() sets the value instantly. Call txtChanged() once after to enable
+  // the submit button (the form uses onkeyup="txtChanged()").
+  for (const [sel, val] of [
+    [SEL.companyId, config.partslink24.companyId],
+    [SEL.username, config.partslink24.username],
+    [SEL.password, config.partslink24.accessCode],
+  ]) {
+    await page.locator(sel).fill(val);
+  }
+  await page.evaluate(() => { if (typeof txtChanged === "function") txtChanged(); });
+
+  // Dismiss overlays again right before submitting — Usercentrics can
+  // re-show the banner asynchronously and swallow the click.
+  await dismissOverlays(page);
+
+  // The login is AJAX — submit via the page's doLoginAjax().
+  await page.evaluate(() => {
+    if (typeof doLoginAjax === "function") doLoginAjax(false);
+    else document.forms["loginForm"]?.submit();
+  });
+
+  // Wait for redirect, error, or squeeze-out prompt.
+  await page.waitForFunction(
+    () => {
+      const err = document.querySelector("#loginErrorDiv");
+      const hasError = err && err.innerText && err.innerText.trim().length > 0;
+      const squeeze = document.querySelector("#sessionSqueezeOutPrompt");
+      const squeezeVisible = squeeze && getComputedStyle(squeeze).display !== "none";
+      const offLogin = !location.pathname.includes("/login.do");
+      return offLogin || hasError || squeezeVisible;
+    },
+    undefined,
+    { timeout: config.browser.navTimeoutMs },
+  ).catch(() => {});
+
+  // Handle session squeeze-out if it appeared.
+  await handleSqueezeOut(page);
+
+  // Check result immediately — no extra waits.
+  const onLogin = page.url().includes("/login.do");
+  if (onLogin) {
+    const errText = await page
+      .locator("#loginErrorDiv").first().innerText()
+      .then((s) => s?.trim() || null)
+      .catch(() => null);
+    return { success: false, errText };
+  }
+  return { success: true, errText: null };
 }
 
 /**
  * Ensure the current context is authenticated. Returns whether a fresh login
  * happened (vs. the existing session being reused).
+ *
+ * Flow:
+ *   1. Open the login page.
+ *   2. Dismiss any cookie banners / consent overlays.
+ *   3. If a session squeeze-out prompt appears, confirm it.
+ *   4. If login still fails, refresh and retry once before giving up.
  */
 async function ensureLoggedIn({ force = false } = {}) {
-  // Only attempt "reuse" if a storage-state file exists — otherwise the
-  // browser has no cookies and the reuse check costs a redundant navigation.
   const sessionExists = await hasSessionFile();
 
   return withPage(async (page) => {
-    // Always enter via the root domain — PartsLink24 serves an interstitial
-    // ("Attention — please read carefully") when you deep-link to /login.do
-    // directly, and the real form isn't rendered on that page.
     await page.goto(config.partslink24.baseUrl, { waitUntil: "domcontentloaded" });
 
     if (!force && sessionExists && (await isLoggedIn(page))) {
@@ -92,156 +213,42 @@ async function ensureLoggedIn({ force = false } = {}) {
       return { loggedIn: true, sessionReused: true };
     }
 
-    // Circuit breaker — only check once we've confirmed the saved session
-    // isn't viable. Otherwise reuse would always work during cooldown.
-    if (loginOnCooldown()) {
-      const mins = Math.ceil(loginCooldownRemainingMs() / 60_000);
-      throw new UpstreamError(
-        `PartsLink24 login is on cooldown after a recent failure (${mins} min left). ` +
-        `Last error: ${lastLoginFailureMessage ?? "unknown"}`,
-        { code: "login_cooldown", minutesRemaining: mins },
-      );
+    // --- Attempt 1 ---
+    const r1 = await fillAndSubmitLogin(page);
+
+    if (r1.success) {
+      lastLoginFailureMessage = null;
+      await saveStorageState();
+      log.info("partslink.login.success", { url: page.url(), attempt: 1 });
+      return { loggedIn: true, sessionReused: false };
     }
 
-    // Root redirects unauth users to the login page; wait for the form to
-    // render before filling.
-    await page.waitForSelector(SEL.companyId, { timeout: config.browser.actionTimeoutMs });
+    // --- Attempt 2: clear session and retry from scratch ---
+    log.warn("partslink.login.retry", { errText: r1.errText, url: page.url() });
+    await clearStorageState();
+    await page.goto(LOGIN_URL(), { waitUntil: "domcontentloaded" });
 
-    // Usercentrics cookie overlay intercepts pointer events on the login
-    // inputs. The banner's accept button sometimes renders outside the
-    // viewport so isVisible/click fail silently — instead we call
-    // Usercentrics' globally-exposed JS API (`window.UC_UI`) which works
-    // regardless of DOM state. Falls back to a forced click on the
-    // button's stable data-testid.
-    await page.evaluate(() => {
-      const ui = window.UC_UI;
-      if (ui?.acceptAllConsents) ui.acceptAllConsents().catch(() => {});
-      else if (ui?.closeCMP) ui.closeCMP();
-    }).catch(() => {});
-    await page.waitForTimeout(300);
-    // Belt-and-braces: force-click the accept button if it's still in the DOM.
-    const cookieBtn = page.locator('button[data-testid="uc-accept-all-button"], [data-testid="uc-container"] button').first();
-    if (await cookieBtn.count() > 0) {
-      await cookieBtn.click({ force: true, timeout: 2000 }).catch(() => {});
-      await page.waitForTimeout(300);
+    const r2 = await fillAndSubmitLogin(page);
+
+    if (r2.success) {
+      lastLoginFailureMessage = null;
+      await saveStorageState();
+      log.info("partslink.login.success", { url: page.url(), attempt: 2 });
+      return { loggedIn: true, sessionReused: false };
     }
 
-    log.info("partslink.login.submitting");
-    // Each field has onkeyup="txtChanged()" which enables the login button
-    // and marks the form ready. Playwright's fill() doesn't fire keyup so
-    // we use pressSequentially() to simulate real key events. Also call
-    // txtChanged() explicitly as a belt-and-braces measure.
-    // Slower typing (80ms/char) + explicit click for focus. 15ms caused
-    // character drops because the form's onkeyup="txtChanged()" ran on
-    // each stroke and occasionally stole focus between presses —
-    // credentials came through truncated ("nl-62" instead of "nl-620935")
-    // and PartsLink24 rejected them as "invalid". This is slower but
-    // reliable; total add to login time is ~2 seconds.
-    for (const [sel, val] of [
-      [SEL.companyId, config.partslink24.companyId],
-      [SEL.username, config.partslink24.username],
-      [SEL.password, config.partslink24.accessCode],
-    ]) {
-      await page.locator(sel).click();
-      await page.locator(sel).pressSequentially(val, { delay: 80 });
-    }
-    await page.evaluate(() => { if (typeof txtChanged === "function") txtChanged(); });
-
-    // Usercentrics re-shows the banner asynchronously — dismiss again just
-    // before submitting so it doesn't swallow the click / steal focus. The
-    // JS API works whether or not the banner is currently visible.
-    await page.evaluate(() => {
-      const ui = window.UC_UI;
-      if (ui?.acceptAllConsents) ui.acceptAllConsents().catch(() => {});
-      else if (ui?.closeCMP) ui.closeCMP();
-    }).catch(() => {});
-    await page.waitForTimeout(400);
-
-    // The login is AJAX — the submit button's onclick calls
-    // `doLoginAjax(false)` and `return false`s on the form submit. Calling
-    // `form.submit()` bypasses the real login, so we invoke the page-
-    // provided function and then wait for the portal to redirect us.
-    await page.evaluate(() => {
-      if (typeof doLoginAjax === "function") doLoginAjax(false);
-      else document.forms["loginForm"]?.submit();
+    // Both attempts failed — log and throw, but NO cooldown.
+    // Next request will try again immediately.
+    const screenshot = await captureFailure(page, "login-failed");
+    lastLoginFailureMessage = r2.errText || r1.errText || "credentials may be incorrect or session was rejected";
+    log.error("partslink.login.failed", {
+      errText: lastLoginFailureMessage, screenshot, url: page.url(),
     });
-
-    // Wait for either the AJAX redirect (URL changes away from /login.do),
-    // the session-squeeze-out prompt (already-logged-in elsewhere), or an
-    // error in #loginErrorDiv.
-    await page.waitForFunction(
-      () => {
-        const err = document.querySelector("#loginErrorDiv");
-        const hasError = err && err.innerText && err.innerText.trim().length > 0;
-        const squeeze = document.querySelector("#sessionSqueezeOutPrompt");
-        const squeezeVisible = squeeze && getComputedStyle(squeeze).display !== "none";
-        const offLogin = !location.pathname.includes("/login.do");
-        return offLogin || hasError || squeezeVisible;
-      },
-      undefined,
-      { timeout: config.browser.navTimeoutMs },
-    ).catch(() => {});
-
-    // Handle the "you're already logged in elsewhere" prompt by confirming
-    // — this calls doLoginAjax(true) which kills the stale session.
-    const squeezeVisible = await page.evaluate(() => {
-      const s = document.querySelector("#sessionSqueezeOutPrompt");
-      return !!s && getComputedStyle(s).display !== "none";
-    }).catch(() => false);
-    if (squeezeVisible) {
-      log.info("partslink.login.squeezeout_confirm");
-      await page.evaluate(() => {
-        if (typeof doLoginAjax === "function") doLoginAjax(true);
-      });
-      await page.waitForFunction(
-        () => !location.pathname.includes("/login.do"),
-        undefined,
-        { timeout: config.browser.navTimeoutMs },
-      ).catch(() => {});
-    }
-
-    await page.waitForTimeout(1500);
-
-    // Read any error message, then verify by navigating to root and
-    // checking the portal renders (has VIN search form). Capture a
-    // screenshot BEFORE the verification nav so it shows the actual
-    // error state (red banner, account-locked message, whatever) rather
-    // than a clean logged-out landing page.
-    const preNavScreenshot = await captureFailure(page, "login-response")
-      .catch(() => null);
-    const errText = await page
-      .locator("#loginErrorDiv").first().innerText()
-      .then((s) => s?.trim() || null)
-      .catch(() => null);
-
-    // PartsLink24 shows a "LOADING..." splash after successful login that
-    // can take 5-10s to transition to startup.do. Give it room.
-    await page.goto(config.partslink24.baseUrl, { waitUntil: "domcontentloaded" });
-    const reallyLoggedIn = await page
-      .locator('form[name="search-text"] input[name="text"]').first()
-      .waitFor({ state: "visible", timeout: 20_000 })
-      .then(() => true)
-      .catch(() => false);
-
-    if (!reallyLoggedIn) {
-      const screenshot = await captureFailure(page, "login-failed");
-      lastLoginFailureAt = Date.now();
-      lastLoginFailureMessage = errText || "credentials may be incorrect or session was rejected";
-      log.error("partslink.login.failed", { errText, screenshot, url: page.url(), cooldownMin: LOGIN_COOLDOWN_MS / 60_000 });
-      throw new UpstreamError("PartsLink24 login failed", {
-        url: page.url(),
-        message: lastLoginFailureMessage,
-        screenshot,
-      });
-    }
-
-    // Fresh login succeeded — reset circuit breaker.
-    lastLoginFailureAt = 0;
-    lastLoginFailureMessage = null;
-
-    await saveStorageState();
-    log.info("partslink.login.success", { url: page.url() });
-    return { loggedIn: true, sessionReused: false };
+    throw new UpstreamError("PartsLink24 login failed", {
+      url: page.url(),
+      message: lastLoginFailureMessage,
+      screenshot,
+    });
   });
 }
 
