@@ -90,6 +90,8 @@ async function captureVehicleImage(page, vin) {
   }
 }
 
+const STARTUP_URL = () => `${config.partslink24.baseUrl}/partslink24/startup.do`;
+
 const GLOBAL_SEARCH = {
   input: 'form[name="search-text"] input[name="text"]',
   submitFn: () => { if (typeof searchText === "function") searchText(); },
@@ -133,10 +135,15 @@ function brandForVin(vin) {
 // into camelCase fields; unknown labels are ignored. Anything we can't
 // confidently parse stays null so the caller can fall back on `companion`
 // (raw text).
+// PartsLink24 companion labels → field mapping. The portal can render
+// in English, Dutch, or German depending on account locale, so we map
+// all known variants for each field.
 const COMPANION_LABELS = {
+  // English
   Model: "model",
   "Date of production": "productionDate",
   Year: "year",
+  "Model year": "year",
   "Sales type": "salesType",
   "Engine Code": "engineCode",
   "Transmission Code": "transmissionCode",
@@ -148,16 +155,54 @@ const COMPANION_LABELS = {
   "Seat combination no.": "seatCombination",
   "Number of Z-Orders": "zOrderCount",
   "PR no.": "prNumber",
+  // Dutch
+  Productiedatum: "productionDate",
+  Modeljaar: "year",
+  Verkooptype: "salesType",
+  Motorcode: "engineCode",
+  Versnellingcode: "transmissionCode",
+  Asaandrijvingskarakteristiek: "axleDrive",
+  Uitrusting: "equipment",
+  "Kleur van het dak": "roofColor",
+  Tapijtkleurcode: "carpetColor",
+  "Kleur exterieur / Laknummer": "paintCode",
+  "Stoelcombinatie nr.": "seatCombination",
+  "Aantal Z-opdrachten": "zOrderCount",
+  "PR nr.": "prNumber",
+  Chassisnummer: "_skip",
+  Voertuigidentificatie: "_skip",
+  Voertuiggegevens: "_skip",
+  "Voertuig Opties": "_skip",
+  "QR-code": "_skip",
+  // German
+  Produktionsdatum: "productionDate",
+  Modelljahr: "year",
+  Verkaufstyp: "salesType",
+  Motorkennung: "engineCode",
+  Getriebeschlüssel: "transmissionCode",
+  Achsantriebscharakteristik: "axleDrive",
+  Ausstattung: "equipment",
+  Dachfarbe: "roofColor",
+  Teppichfarbcode: "carpetColor",
+  "Aussenfarbe / Lacknummer": "paintCode",
+  "Sitzkombination Nr.": "seatCombination",
 };
 
 function parseCompanion(text) {
   if (!text || typeof text !== "string") return {};
-  const lines = text.split(/\n+/).map((s) => s.trim()).filter(Boolean);
+  const lines = text
+    .split(/\n+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0)
+    // Drop disclaimer lines that sometimes appear between labels
+    .filter((s) => !s.startsWith("De FI-resultaten"));
   const out = {};
   for (let i = 0; i < lines.length - 1; i++) {
     const field = COMPANION_LABELS[lines[i]];
-    if (!field) continue;
+    if (!field || field === "_skip") continue;
     const raw = lines[i + 1];
+    // Don't consume next line if it's itself a known label
+    if (COMPANION_LABELS[raw] !== undefined) continue;
     out[field] = field === "year" ? parseYear(raw) : raw;
   }
   return out;
@@ -209,38 +254,41 @@ async function decodeVin(rawVin, { brand: explicitBrand, refresh = false } = {})
     }
   }
 
-  const login = await ensureLoggedIn();
-
   return withPage(async (page) => {
     try {
-      // Navigate to the authenticated portal root — post-login this resolves
-      // to /partslink24/startup.do without triggering the deep-link
-      // "Attention" interstitial. Reuse cookies from ensureLoggedIn().
-      await page.goto(config.partslink24.baseUrl, { waitUntil: "domcontentloaded" });
-      // PartsLink24 shows a "LOADING..." splash post-login for a few seconds
-      // before rendering startup.do. If the form doesn't render within 8s,
-      // we're probably actually logged out (the saved session cookies were
-      // invalidated by a concurrent web-UI login). Force a fresh login and
-      // retry once.
-      const formVisible = await page
-        .waitForSelector(GLOBAL_SEARCH.input, { timeout: 8000 })
-        .then(() => true)
-        .catch(() => false);
-      if (!formVisible) {
-        log.warn("partslink.vin.session_stale", { vin });
-        await ensureLoggedIn({ force: true });
-        await page.goto(config.partslink24.baseUrl, { waitUntil: "domcontentloaded" });
-        await page.waitForSelector(GLOBAL_SEARCH.input, { timeout: 20_000 });
+      // Go straight to startup.do — the browser context shares cookies,
+      // so if we're already logged in the VIN search form renders
+      // immediately without a separate login round-trip.
+      await page.goto(STARTUP_URL(), { waitUntil: "domcontentloaded" });
+
+      // Race: either the VIN search form appears (logged in) or the
+      // login form appears (not logged in). Whichever wins, we act
+      // immediately — no wasted timeout.
+      const winner = await Promise.race([
+        page.waitForSelector(GLOBAL_SEARCH.input, { timeout: 15000 })
+          .then(() => "search"),
+        page.waitForSelector('form[name="loginForm"]', { timeout: 15000 })
+          .then(() => "login"),
+      ]).catch(() => "timeout");
+
+      let formEl;
+      if (winner !== "search") {
+        log.info("partslink.vin.needs_login", { vin, reason: winner });
+        await ensureLoggedIn();
+        await page.goto(STARTUP_URL(), { waitUntil: "domcontentloaded" });
+        formEl = await page.waitForSelector(GLOBAL_SEARCH.input, { timeout: 20_000 });
       }
 
-      // Fill the VIN and trigger the page's own searchText() helper. The
-      // form's onsubmit is prevented, so a normal submit won't fire.
+      // Fill the VIN immediately and submit.
       await page.locator(GLOBAL_SEARCH.input).first().fill(vin);
       await Promise.all([
         page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 20_000 }).catch(() => {}),
         page.evaluate(GLOBAL_SEARCH.submitFn),
       ]);
-      await page.waitForTimeout(2500);
+      // Give the SPA time to fully render the catalog after navigation.
+      // Some brands (Audi, Porsche) need extra time for the React-based
+      // companion panel to hydrate.
+      await page.waitForTimeout(4000);
 
       // After submit the portal routes us to the matching brand's catalog
       // SPA. Extract the breadcrumb + companion panel for vehicle metadata.
@@ -290,7 +338,7 @@ async function decodeVin(rawVin, { brand: explicitBrand, refresh = false } = {})
           url: meta.url,
           title: meta.title,
           companion: meta.companion,
-          sessionReused: login.sessionReused,
+          sessionReused: false,
         },
       };
       // Only cache successful decodes (resolved == true) so we retry
