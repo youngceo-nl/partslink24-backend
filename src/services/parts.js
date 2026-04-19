@@ -182,36 +182,82 @@ async function lookupPart({ vin, brand, partNumber }) {
       // Step 4 — submit the OEM query.
       await page.locator(PART_INPUT).first().fill(partNo);
       await page.locator(PART_INPUT).first().press("Enter");
-      await page.waitForTimeout(2500);
+      // Wait for the search result rows to render. The catalog's default
+      // tree view ALSO uses [data-test-id="row"] (one per main group), so
+      // a plain row wait would short-circuit before the /search?q=... route
+      // even loads. Wait specifically for:
+      //   (a) the URL to contain /search?q={oem} (SPA routing done), AND
+      //   (b) at least one row that carries a descriptionValue cell
+      //       (search-result specific).
+      const encodedPartNo = encodeURIComponent(partNo);
+      await page.waitForFunction(
+        (encoded) => location.href.includes(`/search?q=${encoded}`),
+        encodedPartNo,
+        { timeout: 15_000 },
+      ).catch(() => {});
+      await page.waitForFunction(
+        () => {
+          const rows = document.querySelectorAll('[data-test-id="row"]');
+          return Array.from(rows).some(
+            (r) => r.querySelector('[data-test-id="descriptionValue"]'),
+          );
+        },
+        undefined,
+        { timeout: 15_000 },
+      ).catch(() => {});
 
-      // Step 5 — parse result rows from stable data-test-ids.
-      const results = await page.evaluate(() => {
+      // Step 5 — parse result rows. The current Mercedes catalog uses:
+      //   descriptionValue — human-readable part name ("ANTENNE (Dakframe achter)")
+      //   mgValue          — main group, already prefixed with code ("82 Elektrische installatie")
+      //   sgValue          — subgroup ("346 Antenne, antenneversterker en kabelsets")
+      // Older catalogs (still live on other brands) also expose:
+      //   partnoValue, nameValue, btnrValue
+      // We support both and prefer the new shape when present.
+      const results = await page.evaluate((searchQuery) => {
         const text = (el) => (el?.innerText || "").replace(/\s+/g, " ").trim();
-        const pick = (row, testId) => text(row.querySelector(`[data-test-id="${testId}"] ._value_15k4v_1`)
-          || row.querySelector(`[data-test-id="${testId}"] span`));
-        const rows = Array.from(document.querySelectorAll('[data-test-id="row"]'))
-          .map((row) => ({
-            partNo: pick(row, "partnoValue"),
-            description: pick(row, "nameValue"),
-            mg: pick(row, "mgValue"),
-            sg: pick(row, "sgValue"),
-            illustration: pick(row, "btnrValue"),
-          }))
-          .filter((r) => r.partNo);
+        // Extract the VALUE for a labeled cell: walk past the "Aanduiding" /
+        // "Hoofdgroep" / "Subgroep" label div, return the last inner span's
+        // text (that's where the value sits). If no spans exist, strip the
+        // label from the combined text.
+        const valueIn = (el) => {
+          if (!el) return null;
+          const spans = el.querySelectorAll("span");
+          if (spans.length > 0) {
+            const last = spans[spans.length - 1];
+            const v = text(last);
+            if (v) return v;
+          }
+          const full = text(el);
+          return full.replace(/^(Aanduiding|Hoofdgroep|Subgroep|Aanduid\.|Benaming)\s*/i, "") || null;
+        };
+        const pick = (row, testId) => valueIn(row.querySelector(`[data-test-id="${testId}"]`));
 
-        // Map main-group code → name from the right-side table
-        // ("1 Engine", "9 Electrics", "0 Access./Infotainment/cell.").
-        const mgMap = {};
-        for (const row of document.querySelectorAll('[data-test-id="row"], tr')) {
-          const t = text(row);
-          const m = t.match(/^(\d)\s+(.+?)(\s{2}|$)/);
-          if (m && !mgMap[m[1]]) mgMap[m[1]] = m[2].slice(0, 60);
-        }
-        return { rows, mgMap };
-      });
+        const rows = Array.from(document.querySelectorAll('[data-test-id="row"]'))
+          .map((row) => {
+            const description = pick(row, "descriptionValue") ?? pick(row, "nameValue");
+            const mg = pick(row, "mgValue");
+            const sg = pick(row, "sgValue");
+            const partNoRaw = pick(row, "partnoValue");
+            const illustration = pick(row, "btnrValue");
+            return {
+              partNo: partNoRaw || searchQuery, // Mercedes rows drop the OEM cell; fall back to our query.
+              description,
+              mg,
+              sg,
+              illustration,
+            };
+          })
+          .filter((r) => r.description || r.mg || r.sg);
+
+        return { rows };
+      }, partNo);
 
       const first = results.rows[0] || null;
-      const mainGroup = first?.mg ? (results.mgMap[first.mg] ?? null) : null;
+      // mgValue already contains the code + label ("82 Elektrische installatie"),
+      // so we can use it directly as the `category` field without a lookup map.
+      const mainGroup = first?.mg ?? null;
+      const mgNumber = first?.mg?.match(/^(\d+)/)?.[1] ?? null;
+      const sgNumber = first?.sg?.match(/^(\d+)/)?.[1] ?? null;
 
       // Step 6+7 — click the first row + extract the shadow-DOM canvas.
       let partImageUrl = null;
@@ -263,8 +309,11 @@ async function lookupPart({ vin, brand, partNumber }) {
         description: first?.description ?? null,
         imageUrl: partImageUrl,
         category: mainGroup,
-        mainGroupNumber: first?.mg ?? null,
-        subGroupNumber: first?.sg ?? null,
+        // mg/sgNumber extract just the leading digits ("82", "346") so callers
+        // can key off the code alone; mg/sg below keep the full "82 Elektrische
+        // installatie" string for display.
+        mainGroupNumber: mgNumber,
+        subGroupNumber: sgNumber,
         illustrationNumber: first?.illustration ?? null,
         alternatives: results.rows.slice(1).map((r) => ({
           partNumber: r.partNo,
