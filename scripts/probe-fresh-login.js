@@ -75,6 +75,17 @@ async function main() {
 
   await page.evaluate(() => { if (typeof doLoginAjax === "function") doLoginAjax(false); });
 
+  // Handle squeeze-out prompt ("Wilt u de actuele sessie beëindigen?")
+  await page.waitForTimeout(1500);
+  const squeezeVisible = await page.evaluate(() => {
+    const el = document.getElementById("sessionSqueezeOutPrompt");
+    return !!el && getComputedStyle(el).display !== "none";
+  }).catch(() => false);
+  if (squeezeVisible) {
+    console.log("[probe] squeeze-out → confirming");
+    await page.evaluate(() => { if (typeof doLoginAjax === "function") doLoginAjax(true); });
+  }
+
   await page.waitForSelector('form[name="search-text"] input[name="text"]', { timeout: 30_000 });
   console.log("[probe] logged in, entering VIN:", VIN);
 

@@ -23,6 +23,7 @@ const config = require("../config");
 const log = require("../utils/logger");
 const { withPage, withDeferredPage } = require("./browser");
 const { ensureLoggedIn } = require("./partslink");
+const { openCatalog, SEL: CATALOG_INPUTS } = require("./catalog");
 const { UpstreamError, ValidationError } = require("../utils/errors");
 const { captureFailure } = require("../utils/screenshot");
 
@@ -113,25 +114,60 @@ const CATALOG_SEL = {
 
 const VIN_REGEX = /^[A-HJ-NPR-Z0-9]{17}$/;
 
-// VIN WMI prefix → PartsLink24 catalog slug. Only brands with a confirmed
-// `{slug}_parts` service are mapped — others return null so callers can
-// pass an explicit `brand`.
+// VIN WMI prefix → PartsLink24 catalog slug. Slugs must match the service
+// param exposed on /partslink24/launchCatalog.do (see the brand-menu HTML
+// for the full list). Prefix patterns follow ISO 3780 WMI assignments.
+// First match wins — narrower patterns (e.g. Infiniti's JNK) must come
+// before broader ones that would otherwise swallow them (e.g. Nissan's JN).
 const WMI_BRAND = [
-  [/^WBA|^WBS/i, "bmw"],
-  [/^WAU|^WA1|^WUA/i, "audi"],
-  [/^WDD|^WDB|^WDC|^W1K|^W1N/i, "mercedes"],
-  [/^WP0|^WP1/i, "porsche"],
+  // BMW Group
+  [/^WBA|^WBS|^WBX|^WBY|^5UX|^5YM|^4US/i, "bmw"],
+  [/^WMW/i, "mini"],
+  // Mercedes-Benz Group (sedans/coupes first, then vans, then smart).
+  [/^WDD|^WDB|^WDC|^W1K|^W1N|^4JG/i, "mercedes"],
+  [/^WDF|^W1V|^W1W|^WDY/i, "mercedesvans"],
+  [/^WME/i, "smart"],
+  // VW Group
+  [/^WAU|^WA1|^WUA|^TRU/i, "audi"],
+  [/^WVW|^3VW|^1VW|^9BW|^LSV/i, "vw"],
+  [/^WV1|^WV2/i, "vn"],
   [/^TMB/i, "skoda"],
-  [/^VSS/i, "seat"],
+  [/^VSS|^VSE/i, "seat"],
+  [/^VSZ/i, "cupra"],
+  // Porsche
+  [/^WP0|^WP1/i, "porsche"],
+  // Stellantis — Fiat family
   [/^ZFA/i, "fiatp"],
-  [/^VF1/i, "renault"],
-  [/^VF3/i, "peugeot"],
-  [/^VF7/i, "citroen"],
-  [/^NLHA|^KMH/i, "hyundai"],
-  [/^KNA|^KND/i, "kia"],
-  [/^JT|^5T|^2T/i, "toyota"],
-  [/^JN|^1N/i, "nissan"],
-  [/^YV1/i, "volvo"],
+  [/^ZAR/i, "alfa"],
+  [/^ZLA/i, "lancia"],
+  // Stellantis — PSA brands
+  [/^VF3|^VR3/i, "peugeot"],
+  [/^VF7|^VR7/i, "citroen"],
+  [/^UU1|^UU5/i, "dacia"],
+  [/^VF1|^VF6|^VF8/i, "renault"],
+  [/^W0L/i, "opel"],
+  [/^W0V/i, "vauxhall"],
+  // Ford
+  [/^WF0|^WF2/i, "fordp"],
+  // Asian brands
+  [/^NLHA|^KMH|^KMF|^TMA|^NLH/i, "hyundai"],
+  [/^KNA|^KND|^KNC|^U5Y|^U6Y/i, "kia"],
+  // Infiniti BEFORE Nissan — JNK would otherwise match JN.
+  [/^JNK|^JNR|^JNX|^SJK/i, "infiniti"],
+  [/^JN|^1N|^SJN|^VWA/i, "nissan"],
+  [/^JT|^5T|^2T|^VNK|^SB1/i, "toyota"],
+  [/^JMB|^JMY|^JA3|^JA4/i, "mmc"], // Mitsubishi — PL24 slug is "mmc_parts"
+  [/^JS|^TSM|^9M|^KL0/i, "suzuki"],
+  // Volvo
+  [/^YV1|^YV4/i, "volvo"],
+  // Jaguar / Land Rover
+  [/^SAJ/i, "jaguar"],
+  [/^SAL/i, "landrover"],
+  // Jeep (Stellantis)
+  [/^1J|^ZAC/i, "jeep"],
+  // Bentley / Iveco
+  [/^SCB/i, "bentley"],
+  [/^ZCF/i, "iveco"],
 ];
 
 function brandForVin(vin) {
@@ -168,6 +204,7 @@ const COMPANION_LABELS = {
   Productiedatum: "productionDate",
   Modeljaar: "year",
   Verkooptype: "salesType",
+  Verkoopbenaming: "model",          // Mercedes: "C 180 Estate", "GT3 RS GT3-3"
   Motorcode: "engineCode",
   Versnellingcode: "transmissionCode",
   Asaandrijvingskarakteristiek: "axleDrive",
@@ -175,6 +212,7 @@ const COMPANION_LABELS = {
   "Kleur van het dak": "roofColor",
   Tapijtkleurcode: "carpetColor",
   "Kleur exterieur / Laknummer": "paintCode",
+  Laknummer: "paintCode",             // Mercedes brand-catalog uses bare label
   "Stoelcombinatie nr.": "seatCombination",
   "Aantal Z-opdrachten": "zOrderCount",
   "PR nr.": "prNumber",
@@ -251,6 +289,84 @@ function cacheSet(vin, result) {
   decodeCache.set(vin, { at: Date.now(), result });
 }
 
+// Fallback flow when the global search on /partslink24/startup.do returns
+// "VIN not in any catalog". Loads the brand's SPA directly at
+// /partslink24/launchCatalog.do?service={brand}_parts (redirects into
+// /pl24-app/{brand}_parts/…) and fills the VIN into the catalog's
+// "Directe toegang" input ([data-test-id="vehicleSearchInput"]).
+//
+// Returns one of:
+//   "resolved"        — vehicle metadata loaded, caller should extract
+//   "brand_not_open"  — account has no subscription / catalog stays in demo
+//   "input_disabled"  — dealer context missing, VIN input is disabled
+//   "vin_not_found"   — brand catalog also rejected the VIN
+//   "timeout"         — neither success nor a clean error within the window
+//
+// Leaves the page positioned on whichever catalog state it ended on — the
+// caller extracts metadata on "resolved" and falls through otherwise.
+async function retryViaBrandCatalog(page, vin, brand) {
+  try {
+    await openCatalog(page, brand);
+  } catch (err) {
+    log.warn("partslink.vin.brand_catalog_open_failed", { vin, brand, message: err.message });
+    return "brand_not_open";
+  }
+
+  // VIN input should be present. If missing entirely, the brand isn't
+  // accessible on this account (demo mode / no subscription).
+  const vinInput = page.locator(CATALOG_INPUTS.vinInput).first();
+  const visible = await vinInput.isVisible({ timeout: 5000 }).catch(() => false);
+  if (!visible) return "brand_not_open";
+
+  // Disabled = dealer context still missing. Surface as its own state so
+  // the caller can show a clearer error message.
+  const editable = await vinInput.isEditable({ timeout: 2000 }).catch(() => false);
+  if (!editable) return "input_disabled";
+
+  await vinInput.fill(vin);
+
+  // Prefer the explicit submit button; fall back to Enter if the test-id
+  // isn't rendered (older catalog builds use a wrapping button).
+  const submit = page.locator(CATALOG_INPUTS.vinSubmit).first();
+  const hasSubmit = await submit.isVisible({ timeout: 1500 }).catch(() => false);
+  if (hasSubmit) await submit.click().catch(() => {});
+  else await vinInput.press("Enter").catch(() => {});
+
+  // Race: companion hydrates with our VIN (success), or a catalog-level
+  // error toast/inline message shows up (not found on this catalog).
+  const outcome = await Promise.race([
+    page
+      .waitForFunction(
+        (v) => {
+          const el = document.querySelector('[data-test-id="companion"]');
+          return !!el && (el.innerText || "").includes(v);
+        },
+        vin,
+        { timeout: 20_000 },
+      )
+      .then(() => "resolved"),
+    page
+      .waitForFunction(
+        () => {
+          const txt = (document.body?.innerText || "").toLowerCase();
+          return (
+            txt.includes("geen voertuig") ||
+            txt.includes("niet gevonden") ||
+            txt.includes("not found") ||
+            txt.includes("no vehicle") ||
+            txt.includes("kein fahrzeug")
+          );
+        },
+        undefined,
+        { timeout: 20_000 },
+      )
+      .then(() => "vin_not_found"),
+  ]).catch(() => "timeout");
+
+  log.info("partslink.vin.brand_catalog_outcome", { vin, brand, outcome });
+  return outcome;
+}
+
 async function decodeVin(rawVin, { brand: explicitBrand, refresh = false } = {}) {
   const vin = validateVin(rawVin);
   const hintedBrand = explicitBrand ?? brandForVin(vin);
@@ -305,11 +421,30 @@ async function decodeVin(rawVin, { brand: explicitBrand, refresh = false } = {})
       ]).catch(() => "timeout");
 
       if (outcome === "not_found") {
-        const errText = await page.locator("#search-error").first().innerText()
-          .then((s) => s.trim()).catch(() => "VIN not in any catalog");
-        throw new UpstreamError("VIN not found in any PartsLink24 catalog", {
-          vin, code: "vin_not_in_catalog", portalMessage: errText,
-        });
+        // The global search has a narrower catalog index than individual
+        // brand SPAs — e.g. some W1K Mercedes VINs aren't findable here but
+        // resolve fine from the brand page's "Directe toegang" input. If we
+        // can guess the brand from the WMI, try the brand-catalog fallback.
+        if (hintedBrand) {
+          log.info("partslink.vin.global_not_found_retry_brand", { vin, brand: hintedBrand });
+          const retryOutcome = await retryViaBrandCatalog(page, vin, hintedBrand);
+          if (retryOutcome === "resolved") {
+            // Success — drop into the shared extract/return path below.
+          } else {
+            const errText = await page.locator("#search-error").first().innerText()
+              .then((s) => s.trim()).catch(() => "VIN not in any catalog");
+            throw new UpstreamError("VIN not found in any PartsLink24 catalog", {
+              vin, code: "vin_not_in_catalog", portalMessage: errText,
+              fallbackTried: hintedBrand, fallbackOutcome: retryOutcome,
+            });
+          }
+        } else {
+          const errText = await page.locator("#search-error").first().innerText()
+            .then((s) => s.trim()).catch(() => "VIN not in any catalog");
+          throw new UpstreamError("VIN not found in any PartsLink24 catalog", {
+            vin, code: "vin_not_in_catalog", portalMessage: errText,
+          });
+        }
       }
 
       // Wait for the companion panel to hydrate. "Hydrated" = its text
