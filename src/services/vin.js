@@ -21,7 +21,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const config = require("../config");
 const log = require("../utils/logger");
-const { withPage } = require("./browser");
+const { withPage, withDeferredPage } = require("./browser");
 const { ensureLoggedIn } = require("./partslink");
 const { UpstreamError, ValidationError } = require("../utils/errors");
 const { captureFailure } = require("../utils/screenshot");
@@ -63,8 +63,20 @@ async function captureVehicleImage(page, vin) {
         .waitFor({ state: "visible", timeout: 5000 }).catch(() => {});
     }
 
-    // Give the panel time to fully render its image layers.
-    await page.waitForTimeout(2000);
+    // Wait for the exploded-view image layers to actually finish loading
+    // instead of a blind sleep — any <img> inside the hotspots parent with
+    // complete=true and naturalWidth>0 means the layer has rendered.
+    await page.waitForFunction(
+      () => {
+        const parent = document.querySelector(".hotspots-captions-parent");
+        if (!parent) return false;
+        const imgs = parent.querySelectorAll("img");
+        if (imgs.length === 0) return false;
+        return Array.from(imgs).every((img) => img.complete && img.naturalWidth > 0);
+      },
+      undefined,
+      { timeout: 5000 },
+    ).catch(() => {});
 
     // Screenshot the .hotspots-captions-parent element which contains
     // the exploded-view diagram of the vehicle.
@@ -251,7 +263,7 @@ async function decodeVin(rawVin, { brand: explicitBrand, refresh = false } = {})
     }
   }
 
-  return withPage(async (page) => {
+  return withDeferredPage(async (page, closePage) => {
     try {
       // Go straight to startup.do — the browser context shares cookies,
       // so if we're already logged in the VIN search form renders
@@ -276,16 +288,41 @@ async function decodeVin(rawVin, { brand: explicitBrand, refresh = false } = {})
         formEl = await page.waitForSelector(GLOBAL_SEARCH.input, { timeout: 20_000 });
       }
 
-      // Fill the VIN immediately and submit.
+      // Fill the VIN and submit. Don't await navigation separately — on a
+      // not-found the portal renders `#search-error` inline without navigating,
+      // so a plain waitForNavigation burns the full timeout. Instead, fire
+      // the submit and race against whichever outcome appears first.
       await page.locator(GLOBAL_SEARCH.input).first().fill(vin);
-      await Promise.all([
-        page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 20_000 }).catch(() => {}),
-        page.evaluate(GLOBAL_SEARCH.submitFn),
-      ]);
-      // Give the SPA time to fully render the catalog after navigation.
-      // Some brands (Audi, Porsche) need extra time for the React-based
-      // companion panel to hydrate.
-      await page.waitForTimeout(4000);
+      await page.evaluate(GLOBAL_SEARCH.submitFn);
+
+      // Race: inline not-found error, catalog breadcrumb (nav succeeded),
+      // or timeout. Bail fast on the error.
+      const outcome = await Promise.race([
+        page.waitForSelector('#search-error:visible', { timeout: 20_000 })
+          .then(() => "not_found"),
+        page.waitForSelector(CATALOG_SEL.breadcrumbBrand, { timeout: 20_000 })
+          .then(() => "catalog"),
+      ]).catch(() => "timeout");
+
+      if (outcome === "not_found") {
+        const errText = await page.locator("#search-error").first().innerText()
+          .then((s) => s.trim()).catch(() => "VIN not in any catalog");
+        throw new UpstreamError("VIN not found in any PartsLink24 catalog", {
+          vin, code: "vin_not_in_catalog", portalMessage: errText,
+        });
+      }
+
+      // Wait for the companion panel to hydrate. "Hydrated" = its text
+      // contains the VIN we just searched, which is locale-independent.
+      // Falls back to the previous 4s safety margin on timeout.
+      await page.waitForFunction(
+        (vin) => {
+          const el = document.querySelector('[data-test-id="companion"]');
+          return !!el && (el.innerText || "").includes(vin);
+        },
+        vin,
+        { timeout: 10_000 },
+      ).catch(() => {});
 
       // After submit the portal routes us to the matching brand's catalog
       // SPA. Extract the breadcrumb + companion panel for vehicle metadata.
@@ -301,10 +338,10 @@ async function decodeVin(rawVin, { brand: explicitBrand, refresh = false } = {})
 
       const parsed = parseCompanion(meta.companion);
 
-      // Capture the exploded-view diagram from Graphical Navigation. Best
-      // effort — if the element isn't there (catalog still loading, or
-      // this brand doesn't expose one) we simply return null.
-      const imagePath = await captureVehicleImage(page, vin);
+      // We always return this path. The file is written asynchronously after
+      // the decode response — the frontend shows a brand-logo placeholder and
+      // swaps in the PartsLink24 image once it 200s from the static mount.
+      const imagePath = `/vehicle-images/${vin}.png`;
 
       log.info("partslink.vin.decoded", { vin, brand: hintedBrand, parsed, imagePath });
       const result = {
@@ -341,10 +378,19 @@ async function decodeVin(rawVin, { brand: explicitBrand, refresh = false } = {})
       // Only cache successful decodes (resolved == true) so we retry
       // transient failures on the next call.
       if (result.meta.resolved) cacheSet(vin, result);
+
+      // Kick off image capture in the background. The page stays open until
+      // capture completes; errors are swallowed (imagePath may 404 briefly —
+      // the frontend falls back to a brand logo until it succeeds).
+      captureVehicleImage(page, vin)
+        .catch((err) => log.warn("partslink.vin.bg_image_failed", { vin, message: err.message }))
+        .finally(() => closePage());
+
       return result;
     } catch (err) {
       const screenshot = await captureFailure(page, `vin-global`);
       log.error("partslink.vin.decode.failed", { vin, message: err.message, screenshot });
+      await closePage();
       throw new UpstreamError("VIN decode failed", { vin, message: err.message, screenshot });
     }
   });

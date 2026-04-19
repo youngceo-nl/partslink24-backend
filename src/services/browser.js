@@ -30,6 +30,7 @@ async function ensureBrowser() {
     log.info("browser.launching", { headless: config.browser.headless });
     browser = await chromium.launch({
       headless: config.browser.headless,
+      slowMo: parseInt(process.env.PLAYWRIGHT_SLOWMO ?? "0", 10) || 0,
       args: ["--disable-blink-features=AutomationControlled"],
     });
 
@@ -113,6 +114,24 @@ async function withPage(fn) {
   }
 }
 
+/**
+ * Like withPage, but the caller is responsible for closing the page. Used
+ * when you want to return to the caller while a background task (e.g. image
+ * capture) keeps using the page. On throw, the page is closed automatically
+ * so we never leak pages on the error path.
+ */
+async function withDeferredPage(fn) {
+  const { context: ctx } = await ensureBrowser();
+  const page = await ctx.newPage();
+  const closePage = () => page.close().catch(() => {});
+  try {
+    return await fn(page, closePage);
+  } catch (err) {
+    await closePage();
+    throw err;
+  }
+}
+
 async function shutdown() {
   try { await context?.close(); } catch { /* ignore */ }
   try { await browser?.close(); } catch { /* ignore */ }
@@ -123,6 +142,7 @@ async function shutdown() {
 module.exports = {
   ensureBrowser,
   withPage,
+  withDeferredPage,
   saveStorageState,
   clearStorageState,
   shutdown,

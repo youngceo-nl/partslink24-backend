@@ -32,20 +32,30 @@ const SEL = {
 };
 
 /**
- * Detect post-login state. We treat the visible company-ID input as the
- * authoritative "logged out" signal — the portal redirects unauth requests
- * to /login.do so the safe default when we can't read the page is "logged
- * out" (force a fresh login rather than paper over an expired session).
+ * Detect post-login state via DOM, not URL. The partslink24 homepage embeds
+ * the login form as a sidebar panel, so a stale-session user lands on a URL
+ * that doesn't contain /login.do while still being logged out — checking the
+ * URL alone silently reuses broken sessions forever.
  */
 async function isLoggedIn(page) {
-  const onLoginPath = page.url().includes(LOGIN_PATH);
-  if (!onLoginPath) return true;
-  const inputVisible = await page
-    .locator(SEL.companyId)
-    .first()
-    .isVisible({ timeout: 3000 })
-    .catch(() => true); // on error, assume form is there → logged out
-  return !inputVisible;
+  // Give the page a beat to render after domcontentloaded — form elements
+  // can have display:none until CSS/JS runs.
+  await page.waitForLoadState("networkidle", { timeout: 4000 }).catch(() => {});
+
+  // Evaluate both signals synchronously in the DOM to sidestep Playwright
+  // visibility timing quirks. offsetParent===null is the cheap check for
+  // "actually painted".
+  const state = await page.evaluate(() => {
+    const search = document.querySelector('form[name="search-text"] input[name="text"]');
+    const login = document.querySelector('input[name="accountLogin"]');
+    return {
+      searchVisible: !!search && search.offsetParent !== null,
+      loginVisible: !!login && login.offsetParent !== null,
+    };
+  }).catch(() => ({ searchVisible: false, loginVisible: true }));
+
+  if (state.searchVisible) return true;
+  return !state.loginVisible;
 }
 
 async function hasSessionFile() {
