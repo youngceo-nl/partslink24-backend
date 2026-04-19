@@ -20,9 +20,14 @@ const CATALOG_URL = (brand) =>
   )}`;
 
 const SEL = {
-  vinInput: '[data-test-id="vehicleSearchInput"] input',
+  // Primary selectors use stable data-test-ids; the ", ..." fallbacks match
+  // by placeholder so catalog UI rebuilds that drop the test-ids don't
+  // silently break the scraper. Verified 2026-04-19 against the Mercedes
+  // catalog where the partSearchInput parent no longer carries the test-id
+  // once a VIN is loaded — the input itself still has the placeholder.
+  vinInput: '[data-test-id="vehicleSearchInput"] input, input[placeholder="Directe toegang"]',
   vinSubmit: '[data-test-id="sendVehicleSearch"]',
-  partInput: '[data-test-id="partSearchInput"] input',
+  partInput: '[data-test-id="partSearchInput"] input, input[placeholder="Onderdelen zoeken"]',
   partSubmit: '[data-test-id="sendPartSearch"]',
   noDealerBtn: '[data-test-id="noDealerSelectedButton"]',
   breadcrumbBrand: '[data-test-id="breadcrumbCatalogName"]',

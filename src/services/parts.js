@@ -24,11 +24,15 @@ const log = require("../utils/logger");
 const { withPage } = require("./browser");
 const { ensureLoggedIn } = require("./partslink");
 const { brandForVin, validateVin } = require("./vin");
+const { openCatalog, SEL: CATALOG_SEL } = require("./catalog");
 const { UpstreamError, ValidationError } = require("../utils/errors");
 const { captureFailure } = require("../utils/screenshot");
 
-const GLOBAL_VIN_INPUT = 'form[name="search-text"] input[name="text"]';
-const PART_INPUT = '[data-test-id="partSearchInput"] input';
+// Re-export the shared selector so the placeholder fallback in catalog.js
+// flows through this module. Previously we had a stricter local copy that
+// broke when PL24 stopped setting data-test-id on the parent of the
+// "Onderdelen zoeken" input.
+const PART_INPUT = CATALOG_SEL.partInput;
 const BRAND_BREADCRUMB = '[data-test-id="breadcrumbCatalogName"]';
 const CATALOG_URL = (brand) =>
   `${config.partslink24.baseUrl}/partslink24/launchCatalog.do?service=${encodeURIComponent(`${brand}_parts`)}`;
@@ -64,25 +68,72 @@ async function lookupPart({ vin, brand, partNumber }) {
 
   return withPage(async (page) => {
     try {
-      // Step 1 — route via VIN to land in the right catalog with vehicle
-      // context. Without a VIN the catalog sometimes hides part search.
+      // Step 1 — land inside the brand catalog with vehicle context.
+      //
+      // When we have a VIN, open the brand SPA directly (skip the global
+      // /startup.do search — its index is narrower, e.g. current-gen
+      // Mercedes W1K* VINs fail there), then fill the VIN into the
+      // catalog's "Directe toegang" input. That's the same path that the
+      // VIN decode uses successfully in services/vin.js, and it leaves
+      // the catalog in "vehicle selected" mode so the part-search input
+      // becomes available.
       if (vin) {
         const valid = validateVin(vin);
-        await page.goto(config.partslink24.baseUrl, { waitUntil: "domcontentloaded" });
-        const formVisible = await page
-          .waitForSelector(GLOBAL_VIN_INPUT, { timeout: 8000 })
-          .then(() => true).catch(() => false);
-        if (!formVisible) {
-          log.warn("partslink.part.session_stale", { partNo, brand: effectiveBrand });
+        await openCatalog(page, effectiveBrand);
+
+        // If the session expired we get redirected to /user/login.do.
+        if (/\/login\.do|\/loginForward\.do/.test(page.url())) {
+          log.warn("partslink.part.session_stale", { partNo, brand: effectiveBrand, url: page.url() });
           await ensureLoggedIn({ force: true });
-          await page.goto(config.partslink24.baseUrl, { waitUntil: "domcontentloaded" });
-          await page.waitForSelector(GLOBAL_VIN_INPUT, { timeout: 20_000 });
+          await openCatalog(page, effectiveBrand);
         }
-        await page.locator(GLOBAL_VIN_INPUT).first().fill(valid);
-        await Promise.all([
-          page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 20_000 }).catch(() => {}),
-          page.evaluate(() => { if (typeof searchText === "function") searchText(); }),
-        ]);
+
+        const vinInput = page.locator(CATALOG_SEL.vinInput).first();
+        const vinVisible = await vinInput.isVisible({ timeout: 6000 }).catch(() => false);
+        if (!vinVisible) {
+          const screenshot = await captureFailure(page, `part-no-vin-input-${effectiveBrand}`);
+          throw new UpstreamError(
+            `PartsLink24 brand catalog (${effectiveBrand}) is not accessible on this account — VIN input not visible.`,
+            { brand: effectiveBrand, code: "brand_not_open", screenshot },
+          );
+        }
+        const editable = await vinInput.isEditable({ timeout: 2000 }).catch(() => false);
+        if (!editable) {
+          const screenshot = await captureFailure(page, `part-vin-disabled-${effectiveBrand}`);
+          throw new UpstreamError(
+            "PartsLink24 VIN input is disabled — dealer selection required before part search is available.",
+            { brand: effectiveBrand, code: "dealer_selection_required", screenshot },
+          );
+        }
+
+        await vinInput.fill(valid);
+        const vinSubmit = page.locator(CATALOG_SEL.vinSubmit).first();
+        if (await vinSubmit.isVisible({ timeout: 1500 }).catch(() => false)) {
+          await vinSubmit.click().catch(() => {});
+        } else {
+          await vinInput.press("Enter").catch(() => {});
+        }
+
+        // Wait for the vehicle context to lock in — companion panel text
+        // must contain the VIN we just searched.
+        const loaded = await page
+          .waitForFunction(
+            (v) => {
+              const el = document.querySelector('[data-test-id="companion"]');
+              return !!el && (el.innerText || "").includes(v);
+            },
+            valid,
+            { timeout: 25_000 },
+          )
+          .then(() => true)
+          .catch(() => false);
+        if (!loaded) {
+          const screenshot = await captureFailure(page, `part-vin-context-${effectiveBrand}`);
+          throw new UpstreamError(
+            `PartsLink24 brand catalog did not load vehicle context for VIN ${valid}.`,
+            { brand: effectiveBrand, code: "vin_context_timeout", screenshot },
+          );
+        }
       } else {
         await page.goto(CATALOG_URL(effectiveBrand), { waitUntil: "domcontentloaded" });
       }
@@ -90,10 +141,27 @@ async function lookupPart({ vin, brand, partNumber }) {
       // Step 2 — wait for catalog SPA to hydrate.
       await page.waitForSelector(BRAND_BREADCRUMB, { timeout: 20_000 }).catch(() => {});
 
-      // Step 3 — surface dealer-gate early so callers see a clean error.
-      const partVisible = await page.locator(PART_INPUT).first()
-        .isVisible({ timeout: 6000 }).catch(() => false);
-      if (!partVisible) {
+      // Step 3 — wait for the part-search input to hydrate. After a VIN
+      // load the catalog continues fetching the groups tree before the
+      // part-search toolbar appears; 6s was too tight for slower vehicles
+      // (Mercedes post-VIN takes up to ~15s). Race against the dealer-gate
+      // button so we fail fast on that specific condition.
+      const partReady = await Promise.race([
+        page.locator(PART_INPUT).first()
+          .waitFor({ state: "visible", timeout: 25_000 })
+          .then(() => "visible"),
+        page.waitForFunction(
+          () => Array.from(document.querySelectorAll("button"))
+            .some((b) => /select dealer|dealer selecteren/i.test(b.innerText || "")
+              && getComputedStyle(b).display !== "none"
+              && (b.offsetWidth > 0 || b.offsetHeight > 0))
+            && !document.querySelector('[data-test-id="partSearchInput"] input, input[placeholder="Onderdelen zoeken"]'),
+          undefined,
+          { timeout: 25_000 },
+        ).then(() => "dealer_gate"),
+      ]).catch(() => "timeout");
+
+      if (partReady !== "visible") {
         const needsDealer = await page.evaluate(() => {
           return Array.from(document.querySelectorAll("button"))
             .some((b) => /select dealer|dealer selecteren/i.test(b.innerText || ""));
