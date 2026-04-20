@@ -50,6 +50,37 @@ function slugifyForFile(raw) {
   return raw.replace(/[^A-Za-z0-9-]/g, "_").slice(0, 80);
 }
 
+// Parse an AVP price string from the Artikel-informatie panel into cents.
+// PartsLink24 uses Dutch formatting on a localised portal:
+//   "€ 4,76"           → 476       (comma decimal)
+//   "€ 1.098,99"       → 109899    (dot thousands, comma decimal)
+//   "€ 1.200"          → 120000    (no decimals)
+//   "EUR 4.76"         → 476       (US fallback, shouldn't happen on PL24 NL)
+// Returns null when no numeric value can be extracted.
+function parseEurPrice(raw) {
+  if (typeof raw !== "string") return null;
+  const cleaned = raw.replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
+  const numMatch = cleaned.match(/(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?|\d+[.,]\d{1,2}|\d+)/);
+  if (!numMatch) return null;
+  let num = numMatch[1];
+  const lastDot = num.lastIndexOf(".");
+  const lastComma = num.lastIndexOf(",");
+  let decimalSep = null;
+  if (lastDot >= 0 && lastComma >= 0) {
+    decimalSep = lastDot > lastComma ? "." : ",";
+  } else if (lastComma >= 0 && /,\d{1,2}$/.test(num)) {
+    decimalSep = ",";
+  } else if (lastDot >= 0 && /\.\d{1,2}$/.test(num) && !/\.\d{3}$/.test(num)) {
+    decimalSep = ".";
+  }
+  if (decimalSep === ",") num = num.replace(/\./g, "").replace(",", ".");
+  else if (decimalSep === ".") num = num.replace(/,/g, "");
+  else num = num.replace(/[.,]/g, "");
+  const n = parseFloat(num);
+  if (!Number.isFinite(n)) return null;
+  return Math.round(n * 100);
+}
+
 function resolveBrand({ vin, brand }) {
   if (brand && typeof brand === "string") return brand.toLowerCase().trim();
   if (vin) return brandForVin(validateVin(vin));
@@ -297,8 +328,76 @@ async function lookupPart({ vin, brand, partNumber }) {
         }
       }
 
+      // Step 8 — pull the AVP ("aanbevolen verkoopprijs") from the
+      // Artikel-informatie panel. That's the only place Mercedes exposes a
+      // retail price inside the catalog. Needed so the price step can fall
+      // back on the PL24 list price when Onderdelenlijn has no listings.
+      //
+      // Flow: after the first row is selected the right-hand detail panel
+      // shows one or more rows with `data-test-id="iconValueValue"` —
+      // inside lives `[aria-label="Artikel-informatie"]` / `.icon--inform-arrow`.
+      // Click the first one that matches our part number (otherwise the
+      // first visible), wait for a row with `[data-test-id="priceValue"]`
+      // to appear, read the value, parse "€ X,XX" into cents.
+      let priceCents = null;
+      let priceCurrency = null;
+      if (first) {
+        try {
+          const clicked = await page.evaluate((queryPartNo) => {
+            const norm = (s) => (s || "").replace(/\s+/g, "").toUpperCase();
+            const wanted = norm(queryPartNo);
+            const rows = Array.from(document.querySelectorAll('[data-test-id="row"]'));
+            // Prefer the row whose partnoValue matches our OEM.
+            const matchRow = rows.find((r) => {
+              const cell = r.querySelector('[data-test-id="partnoValue"]');
+              return cell && norm(cell.innerText).includes(wanted);
+            });
+            const pick = matchRow || rows.find((r) => r.querySelector('[aria-label="Artikel-informatie"], .icon--inform-arrow'));
+            const icon = pick?.querySelector('[aria-label="Artikel-informatie"], .icon--inform-arrow');
+            if (!icon) return false;
+            icon.click();
+            return true;
+          }, partNo);
+          if (clicked) {
+            // Wait up to 10s for a row with a priceValue cell to appear
+            // (SPA fetches the item info async). If it never shows, silently
+            // skip — the caller degrades to "no PL24 price".
+            const priceText = await page
+              .waitForFunction(
+                () => {
+                  const rows = Array.from(document.querySelectorAll('[data-test-id="row"]'));
+                  for (const r of rows) {
+                    const cell = r.querySelector('[data-test-id="priceValue"]');
+                    if (!cell) continue;
+                    const raw = (cell.innerText || "").replace(/\s+/g, " ").trim();
+                    if (raw) return raw;
+                  }
+                  return null;
+                },
+                undefined,
+                { timeout: 10_000, polling: 300 },
+              )
+              .then((h) => h.jsonValue())
+              .catch(() => null);
+            if (typeof priceText === "string" && priceText) {
+              const parsed = parseEurPrice(priceText);
+              if (parsed != null) {
+                priceCents = parsed;
+                priceCurrency = "EUR";
+                log.info("partslink.part.price_captured", { brand: effectiveBrand, partNo, priceCents, rawPriceText: priceText });
+              }
+            }
+            if (priceCents == null) {
+              log.warn("partslink.part.price_missing", { brand: effectiveBrand, partNo });
+            }
+          }
+        } catch (err) {
+          log.warn("partslink.part.price_capture_failed", { brand: effectiveBrand, partNo, message: err.message });
+        }
+      }
+
       log.info("partslink.part.lookup.ok", {
-        brand: effectiveBrand, partNo, resultCount: results.rows.length, partImageUrl,
+        brand: effectiveBrand, partNo, resultCount: results.rows.length, partImageUrl, priceCents,
       });
 
       return {
@@ -308,6 +407,11 @@ async function lookupPart({ vin, brand, partNumber }) {
         name: first?.description ?? null,
         description: first?.description ?? null,
         imageUrl: partImageUrl,
+        // PartsLink24 AVP (aanbevolen verkoopprijs) — the retail list price
+        // for this OEM on the brand catalog. Null when we couldn't open the
+        // Artikel-informatie panel or the catalog doesn't expose a price.
+        priceCents,
+        priceCurrency,
         category: mainGroup,
         // mg/sgNumber extract just the leading digits ("82", "346") so callers
         // can key off the code alone; mg/sg below keep the full "82 Elektrische
